@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.26"
+VERSION = "0.1.27"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -4036,7 +4036,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
   .cpubar .v{margin-top:6px;font-variant-numeric:tabular-nums;color:var(--accent);font-weight:600}
   .coregrid{display:grid;gap:8px;background:transparent;padding:0}
   .corecell{background-color:#0a0f15;border:1.5px solid #28e0c4;border-radius:6px;
-    position:relative;height:60px;overflow:hidden;
+    position:relative;min-height:0;overflow:hidden;
     background-image:
       repeating-linear-gradient(0deg,  transparent 0 calc(25% - 1px), #1a2330 calc(25% - 1px) 25%),
       repeating-linear-gradient(90deg, transparent 0 calc(20% - 1px), #1a2330 calc(20% - 1px) 20%)}
@@ -7368,9 +7368,16 @@ function _renderSmCPU(dev){
   var d = _sysmon.data || {}; var c = d.cpu || {};
   var pct = c.pct==null ? 0 : c.pct;
   var nCores = (c.per_core_pct||[]).length || c.cores || 1;
-  // grid columns: 1 если ≤4 ядер, 2 если ≤16, 4 иначе
-  var cols = nCores <= 4 ? 1 : (nCores <= 16 ? 2 : 4);
+  // grid columns: 1/2/4/8 — при >32 ядрах фиксируем 8 в ряд (до 128 ядер)
+  var cols;
+  if(nCores<=4)        cols=1;
+  else if(nCores<=16)  cols=2;
+  else if(nCores<=32)  cols=4;
+  else                 cols=8;
   var rows = Math.ceil(nCores / cols);
+  // высота ячейки сжимается с ростом числа ядер, чтобы 128 умещалось
+  var cellH = nCores>64 ? 22 : (nCores>32 ? 28 : (nCores>16 ? 32 : (nCores>4 ? 38 : 50)));
+  var gridH = rows*cellH + Math.max(0, rows-1)*8;
   var coreCells = "";
   for(var i=0;i<nCores;i++){
     coreCells += '<div class="corecell"><canvas id="cc-'+i+'"></canvas></div>';
@@ -7381,9 +7388,9 @@ function _renderSmCPU(dev){
       '<div class="v">'+Math.round(pct)+'%</div></div>'+
       '<div class="bcvbox" style="position:relative">'+
         '<div class="coreghdr"><span>Загрузка по ядрам за 60 секунд</span>'+
-        '<span>100% / ядро</span></div>'+
+        '<span>'+nCores+' ядер &middot; 100% / ядро</span></div>'+
         '<div class="coregrid" style="grid-template-columns:repeat('+cols+',1fr);'+
-          'grid-template-rows:repeat('+rows+',1fr);height:280px">'+coreCells+'</div>'+
+          'grid-auto-rows:'+cellH+'px;height:'+gridH+'px">'+coreCells+'</div>'+
       '</div></div>';
 
   el("sysmonChart").innerHTML =
