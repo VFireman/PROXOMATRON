@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.22"
+VERSION = "0.1.25"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -483,17 +483,22 @@ def zfs_info():
 
 
 # ---------- мастер пулов ZFS ----------
+ZFS_MAX_DISKS = 24
 ZFS_MODES = {
-    "single":    {"label": "Одиночный (страйп)", "min": 1, "exact": 0},
-    "mirror":    {"label": "Зеркало (mirror)", "min": 2, "exact": 0},
-    "zr1":       {"label": "RAIDZ1", "min": 3, "exact": 0},
-    "zr2":       {"label": "RAIDZ2", "min": 4, "exact": 0},
-    "mirror2+2": {"label": "Зеркало 2+2 (страйп из двух зеркал)",
-                  "min": 4, "exact": 4},
+    "single": {"label": "Одиночный (страйп)", "min": 1, "max": ZFS_MAX_DISKS,
+               "needs_width": False},
+    "mirror": {"label": "Зеркало", "min": 2, "max": 4,
+               "needs_width": True},
+    "raid10": {"label": "RAID10 (страйп из зеркал)",
+               "min": 4, "max": ZFS_MAX_DISKS, "needs_width": True},
+    "zr1":    {"label": "RAIDZ1", "min": 3, "max": ZFS_MAX_DISKS,
+               "needs_width": False},
+    "zr2":    {"label": "RAIDZ2", "min": 4, "max": ZFS_MAX_DISKS,
+               "needs_width": False},
 }
 
 
-def _zfs_vdev(mode, dpaths):
+def _zfs_vdev(mode, dpaths, width):
     """Аргументы vdev для `zpool create` по выбранному режиму избыточности."""
     if mode == "single":
         return list(dpaths)
@@ -503,9 +508,12 @@ def _zfs_vdev(mode, dpaths):
         return ["raidz1"] + list(dpaths)
     if mode == "zr2":
         return ["raidz2"] + list(dpaths)
-    if mode == "mirror2+2":
-        return ["mirror", dpaths[0], dpaths[1],
-                "mirror", dpaths[2], dpaths[3]]
+    if mode == "raid10":
+        out = []
+        for i in range(0, len(dpaths), width):
+            out.append("mirror")
+            out.extend(dpaths[i:i + width])
+        return out
     return None
 
 
@@ -517,7 +525,7 @@ def zfs_wizard_info():
             "pools": [p.get("name") for p in (zi.get("pools") or [])]}
 
 
-def zfs_create_pool(name, mode, disks):
+def zfs_create_pool(name, mode, disks, width=None):
     """Создать ZFS-пул через `zpool create` в выбранном режиме избыточности."""
     name = (name or "").strip()
     mode = (mode or "").strip()
@@ -531,12 +539,33 @@ def zfs_create_pool(name, mode, disks):
     spec = ZFS_MODES.get(mode)
     if not spec:
         return {"ok": False, "results": [], "msg": "неизвестный режим пула"}
-    if len(disks) < spec["min"]:
+    n = len(disks)
+    if n < spec["min"]:
         return {"ok": False, "results": [],
                 "msg": "режим %s требует не менее %d дисков" % (mode, spec["min"])}
-    if spec["exact"] and len(disks) != spec["exact"]:
+    if "max" in spec and n > spec["max"]:
         return {"ok": False, "results": [],
-                "msg": "режим %s требует ровно %d диска" % (mode, spec["exact"])}
+                "msg": "режим %s принимает не более %d дисков" % (mode, spec["max"])}
+    w = 0
+    if spec["needs_width"]:
+        try:
+            w = int(width)
+        except Exception:
+            return {"ok": False, "results": [],
+                    "msg": "ширина зеркала должна быть числом"}
+        if w not in (2, 3, 4):
+            return {"ok": False, "results": [],
+                    "msg": "ширина зеркала: 2, 3 или 4"}
+        if mode == "mirror" and n != w:
+            return {"ok": False, "results": [],
+                    "msg": "Зеркало шириной %d требует ровно %d диск(а/ов)" % (w, w)}
+        if mode == "raid10":
+            if n % w != 0:
+                return {"ok": False, "results": [],
+                        "msg": "RAID10: число дисков должно быть кратно ширине %d" % w}
+            if n // w < 2:
+                return {"ok": False, "results": [],
+                        "msg": "RAID10: минимум 2 зеркала (%d дисков)" % (2 * w)}
     zi = zfs_info()
     if name in [p.get("name") for p in (zi.get("pools") or [])]:
         return {"ok": False, "results": [],
@@ -553,7 +582,7 @@ def zfs_create_pool(name, mode, disks):
             return {"ok": False, "results": [],
                     "msg": "диск %s выбран дважды" % d}
         dpaths.append(p)
-    vdev = _zfs_vdev(mode, dpaths)
+    vdev = _zfs_vdev(mode, dpaths, w)
     if vdev is None:
         return {"ok": False, "results": [], "msg": "не удалось собрать vdev"}
     results = []
@@ -682,6 +711,100 @@ def zfs_set_cache(bytes_val):
                 "msg": "максимум кэша применён, но не сохранён в конфиг"}
     return {"ok": True, "results": results,
             "msg": "Максимум кэша ZFS ARC установлен: %s." % _hbytes(b)}
+
+
+# ---------- zfs.conf editor ----------
+_MODPROBE_VERBS = ("options", "install", "remove", "alias",
+                   "blacklist", "softdep")
+ZFS_CONF_MAX_BYTES = 64 * 1024
+
+
+def zfs_modparams_info():
+    """Содержимое /etc/modprobe.d/zfs.conf + распарсенные `options zfs k=v`."""
+    content = ""
+    exists = os.path.exists(ZFS_MODPROBE)
+    if exists:
+        try:
+            with open(ZFS_MODPROBE) as f:
+                content = f.read()
+        except Exception as e:
+            return {"path": ZFS_MODPROBE, "exists": True,
+                    "content": "", "parsed": [], "size_bytes": 0,
+                    "error": "не удалось прочитать: %s" % e,
+                    "module_loaded": os.path.exists("/sys/module/zfs")}
+    parsed = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"options\s+zfs\s+(.*)$", line)
+        if not m:
+            continue
+        for tok in m.group(1).split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                parsed.append({"key": k.strip(), "value": v.strip()})
+    runtime_count = 0
+    try:
+        runtime_count = len(os.listdir("/sys/module/zfs/parameters"))
+    except Exception:
+        pass
+    return {
+        "path": ZFS_MODPROBE,
+        "exists": exists,
+        "content": content,
+        "parsed": parsed,
+        "size_bytes": len(content.encode("utf-8")),
+        "module_loaded": os.path.exists("/sys/module/zfs"),
+        "runtime_param_count": runtime_count,
+        "max_bytes": ZFS_CONF_MAX_BYTES,
+    }
+
+
+def zfs_modparams_save(content):
+    """Записать новое содержимое в /etc/modprobe.d/zfs.conf с бэкапом."""
+    if content is None:
+        return {"ok": False, "msg": "пустой запрос"}
+    if not isinstance(content, str):
+        return {"ok": False, "msg": "content должен быть строкой"}
+    if "\x00" in content:
+        return {"ok": False, "msg": "файл не должен содержать нулевых байт"}
+    enc = content.encode("utf-8")
+    if len(enc) > ZFS_CONF_MAX_BYTES:
+        return {"ok": False, "msg": "файл больше %d байт — слишком большой"
+                % ZFS_CONF_MAX_BYTES}
+    bad = []
+    for i, raw in enumerate(content.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        verb = line.split(None, 1)[0]
+        if verb not in _MODPROBE_VERBS:
+            bad.append("стр. %d: неизвестная директива %r (допустимо: %s)"
+                       % (i, verb, ", ".join(_MODPROBE_VERBS)))
+    if bad:
+        return {"ok": False, "msg": "; ".join(bad[:5])}
+    backup = None
+    try:
+        if os.path.exists(ZFS_MODPROBE):
+            backup = "%s.bak.%s" % (ZFS_MODPROBE, time.strftime("%Y%m%d-%H%M%S"))
+            with open(ZFS_MODPROBE) as src, open(backup, "w") as dst:
+                dst.write(src.read())
+    except Exception as e:
+        return {"ok": False, "msg": "не удалось создать бэкап: %s" % e}
+    try:
+        tmp = ZFS_MODPROBE + ".tmp"
+        with open(tmp, "w") as f:
+            text = content if content.endswith("\n") or content == "" else content + "\n"
+            f.write(text)
+        os.replace(tmp, ZFS_MODPROBE)
+    except Exception as e:
+        return {"ok": False, "msg": "не удалось записать %s: %s" % (ZFS_MODPROBE, e),
+                "backup": backup}
+    return {"ok": True,
+            "msg": ("Сохранено в %s. Изменения вступят в силу после "
+                    "`update-initramfs -u` и перезагрузки." % ZFS_MODPROBE),
+            "backup": backup, "size_bytes": len(enc)}
 
 
 # ---------- ceph ----------
@@ -4105,24 +4228,24 @@ INDEX_HTML = r'''<!DOCTYPE html>
       <div class="vtabs">
         <div class="vtab active" data-vtab="pools">&#9633; Пулы</div>
         <div class="vtab" data-vtab="settings">&#9881; Настройки</div>
+        <div class="vtab" data-vtab="tuning">&#128295; Тонкие настройки</div>
       </div>
       <div class="vtabpane active" id="zftab-pools">
         <div id="zfs"></div>
       </div>
       <div class="vtabpane" id="zftab-settings">
-        <div class="lblrow" style="margin:8px 0 12px">
-          <button class="wizbtn" id="zw-open">&#9874; Мастер пулов ZFS</button>
-          <button class="wizbtn" id="cc-open" style="margin-left:8px">&#9881; Управление кэшем</button></div>
-        <div class="netplan">
-          <div class="lbl">Настройки модуля ZFS</div>
+        <div class="lblrow" style="margin:8px 0 14px;justify-content:flex-start">
+          <button class="wizbtn" id="zw-open" style="margin-left:0;padding:10px 22px;font-size:14px;letter-spacing:.4px">&#9874; Мастер пулов ZFS</button>
+          <button class="wizbtn" id="cc-open" style="margin-left:0">&#9881; Управление кэшем</button></div>
+        <div class="netplan" style="margin-top:14px">
+          <div class="lbl">В плане</div>
           <ul class="planlist">
-            <li><b>ARC-кэш</b> &mdash; кнопка «Управление кэшем» выше</li>
-            <li><b>L2ARC / SLOG</b> &mdash; добавление кеш/лог устройств (в плане)</li>
-            <li><b>Сжатие/дедупликация</b> &mdash; глобальные параметры (в плане)</li>
-            <li><b>zfs.conf / module params</b> &mdash; редактирование <code>/etc/modprobe.d/zfs.conf</code> (в плане)</li>
-            <li><b>Автоснимки</b> &mdash; интеграция с <code>zfs-auto-snapshot</code> / <code>zrepl</code> (в плане)</li>
+            <li><b>L2ARC / SLOG</b> &mdash; добавление кеш/лог устройств</li>
           </ul>
         </div>
+      </div>
+      <div class="vtabpane" id="zftab-tuning">
+        <div id="zfs-modparams"></div>
       </div>
     </section>
 
@@ -4332,6 +4455,7 @@ function setZfsTab(name){
     p.classList.toggle("active", p.id==="zftab-"+name);
   });
   try{ localStorage.setItem("vb_zftab", name); }catch(e){}
+  if(name==="tuning" && typeof renderZfsModparams==="function") renderZfsModparams();
 }
 document.querySelectorAll("#view-zfs .vtab").forEach(function(t){
   t.addEventListener("click", function(){ setZfsTab(t.getAttribute("data-vtab")); });
@@ -4837,7 +4961,24 @@ function renderZfs(z){
   }
   var tmap={mirror:"зеркало",raidz1:"RAIDZ1",raidz2:"RAIDZ2",raidz3:"RAIDZ3",
             stripe:"страйп",single:"одиночный диск",draid:"dRAID"};
-  var h="<div class=\"lbl\">Пулы ZFS</div>";
+  var arc=z.arc||{}, sizes=[], amax=1, arcHtml="";
+  if(arc.present){
+    sizes=(arc.series||[]).map(function(x){return x.size||0;});
+    amax=niceMax(Math.max.apply(null,[1].concat(sizes)));
+    arcHtml="<div class=\"lbl\">Кэш ARC</div>"+
+      "<div class=\"graphcard\"><div class=\"gh\">"+
+        "<span class=\"gt\">Размер ARC &mdash; окно 60 с</span>"+
+        "<span class=\"gv\" style=\"color:var(--accent)\">"+hb(arc.size)+"</span>"+
+        "<span class=\"gmax\">/ "+hb(amax)+"</span></div>"+
+        "<canvas class=\"graph\" id=\"arc-graph\"></canvas></div>"+
+      "<div class=\"row r4\" style=\"margin-bottom:14px\">"+
+        mstat("Размер ARC",hb(arc.size))+
+        mstat("Целевой (c)",hb(arc.c))+
+        mstat("Максимум",hb(arc.c_max))+
+        mstat("Хит-рейт",(arc.hit_ratio!=null?arc.hit_ratio+"%":"&mdash;"))+
+      "</div>";
+  }
+  var h=arcHtml+"<div class=\"lbl\">Пулы ZFS</div>";
   pools.forEach(function(p){
     var pct=(p.size&&p.alloc!=null)?(p.alloc/p.size*100):0;
     var capn=parseInt(p.capacity,10); if(isNaN(capn)) capn=Math.round(pct);
@@ -4893,23 +5034,6 @@ function renderZfs(z){
         "<span>"+hb(p.size)+"</span></div>"+
       tree+"</div>";
   });
-  var arc=z.arc||{}, sizes=[], amax=1;
-  if(arc.present){
-    sizes=(arc.series||[]).map(function(x){return x.size||0;});
-    amax=niceMax(Math.max.apply(null,[1].concat(sizes)));
-    h+="<div class=\"lbl\">Кэш ARC</div>"+
-      "<div class=\"graphcard\"><div class=\"gh\">"+
-        "<span class=\"gt\">Размер ARC &mdash; окно 60 с</span>"+
-        "<span class=\"gv\" style=\"color:var(--accent)\">"+hb(arc.size)+"</span>"+
-        "<span class=\"gmax\">/ "+hb(amax)+"</span></div>"+
-        "<canvas class=\"graph\" id=\"arc-graph\"></canvas></div>"+
-      "<div class=\"row r4\">"+
-        mstat("Размер ARC",hb(arc.size))+
-        mstat("Целевой (c)",hb(arc.c))+
-        mstat("Максимум",hb(arc.c_max))+
-        mstat("Хит-рейт",(arc.hit_ratio!=null?arc.hit_ratio+"%":"&mdash;"))+
-      "</div>";
-  }
   box.innerHTML=h;
   if(arc.present){ var cv=el("arc-graph"); if(cv) drawArea(cv,sizes,"#38bdf8",amax); }
 }
@@ -6152,12 +6276,13 @@ el("clmask").addEventListener("click",function(e){
 /* ===== Мастер пулов ZFS ===== */
 var zw=null;
 var ZW_LABELS=["Параметры","Проверка","Готово"];
+var ZW_MAX=24;
 var ZW_MODES=[
-  {id:"single",   ic:"&#9707;",nm:"Одиночный",  ad:"страйп, без избыточности",  min:1,exact:0},
-  {id:"mirror",   ic:"&#9636;",nm:"Зеркало",    ad:"одно зеркало (mirror)",     min:2,exact:0},
-  {id:"zr1",      ic:"&#9638;",nm:"RAIDZ1",     ad:"1 диск чётности, мин. 3",   min:3,exact:0},
-  {id:"zr2",      ic:"&#9638;",nm:"RAIDZ2",     ad:"2 диска чётности, мин. 4",  min:4,exact:0},
-  {id:"mirror2+2",ic:"&#9707;",nm:"Зеркало 2+2",ad:"страйп из 2 зеркал по 2",   min:4,exact:4}
+  {id:"single",ic:"&#9707;",nm:"Одиночный",ad:"страйп без избыточности, до 24 дисков",min:1,max:ZW_MAX,width:false},
+  {id:"mirror",ic:"&#9636;",nm:"Зеркало",  ad:"одно зеркало 2/3/4-way",                min:2,max:4,    width:true},
+  {id:"raid10",ic:"&#9707;",nm:"RAID10",   ad:"страйп из зеркал, до 24 дисков",        min:4,max:ZW_MAX,width:true},
+  {id:"zr1",   ic:"&#9638;",nm:"RAIDZ1",   ad:"1 диск чётности, мин. 3",               min:3,max:ZW_MAX,width:false},
+  {id:"zr2",   ic:"&#9638;",nm:"RAIDZ2",   ad:"2 диска чётности, мин. 4",              min:4,max:ZW_MAX,width:false}
 ];
 function zwMode(id){
   for(var i=0;i<ZW_MODES.length;i++) if(ZW_MODES[i].id===id) return ZW_MODES[i];
@@ -6528,6 +6653,106 @@ el("ccclose").addEventListener("click",ccClose);
 el("ccmask").addEventListener("click",function(e){
   if(e.target===this&&cc&&!cc.busy) ccClose();
 });
+
+/* ===== редактор /etc/modprobe.d/zfs.conf ===== */
+var _zmp={loaded:false,busy:false,data:null};
+function renderZfsModparams(){
+  var root=el("zfs-modparams"); if(!root) return;
+  if(!_zmp.loaded){
+    root.innerHTML='<div class="panel"><div class="lbl">'+
+      'Параметры модуля ZFS (zfs.conf)</div>'+
+      '<div style="padding:10px 12px;color:var(--dim)">загрузка&hellip;</div></div>';
+  }
+  fetch("/api/zfs/modparams",{cache:"no-store"})
+    .then(function(r){return r.json();})
+    .then(function(d){ _zmp.data=d; _zmp.loaded=true; _zmpDraw(); })
+    .catch(function(e){
+      root.innerHTML='<div class="panel"><div class="lbl">'+
+        'Параметры модуля ZFS</div><div class="err" style="margin:10px 12px">'+
+        'ошибка: '+esc(String(e))+'</div></div>';
+    });
+}
+function _zmpDraw(){
+  var root=el("zfs-modparams"); if(!root) return;
+  var d=_zmp.data||{};
+  var parsedRows="";
+  (d.parsed||[]).forEach(function(p){
+    parsedRows+='<tr><td><code>'+esc(p.key)+'</code></td>'+
+      '<td><code>'+esc(p.value)+'</code></td></tr>';
+  });
+  var parsedTbl=parsedRows
+    ? '<table class="kvtbl" style="margin-top:6px"><tr>'+
+        '<th style="width:50%">Параметр</th><th>Значение</th></tr>'+
+        parsedRows+'</table>'
+    : '<div class="sd" style="margin-top:6px">в файле нет директив '+
+      '<code>options zfs &hellip;</code></div>';
+  var bytes=d.size_bytes||0;
+  var modOk=!!d.module_loaded;
+  var rtCount=d.runtime_param_count||0;
+  var content=d.content||"";
+  var hint="Файл <code>"+esc(d.path||"/etc/modprobe.d/zfs.conf")+
+    "</code> загружается при инициализации модуля ZFS. "+
+    "Допустимые директивы: <code>options</code>, <code>install</code>, "+
+    "<code>remove</code>, <code>alias</code>, <code>blacklist</code>, "+
+    "<code>softdep</code>. "+
+    "Изменения вступают в силу после "+
+    "<code>update-initramfs -u</code> и перезагрузки.";
+  var status='модуль zfs: '+(modOk?'<span class="srcok">загружен</span>'
+    :'<span class="srcno">не загружен</span>')+
+    ' &middot; параметров /sys/module/zfs/parameters: <b>'+rtCount+'</b>'+
+    ' &middot; размер файла: <b>'+bytes+'</b> Б';
+  root.innerHTML=
+    '<div class="panel">'+
+    '<div class="lbl">Параметры модуля ZFS (zfs.conf)</div>'+
+    '<div style="padding:10px 12px">'+
+      '<div class="sd" style="margin-bottom:8px">'+hint+'</div>'+
+      '<div class="sd" style="margin-bottom:6px">'+status+'</div>'+
+      '<div class="sd" style="margin:8px 0 4px"><b>Распарсенные options zfs</b></div>'+
+      parsedTbl+
+      '<div class="sd" style="margin:12px 0 4px"><b>Содержимое</b> '+
+        '(до '+(d.max_bytes||65536)+' байт)</div>'+
+      '<textarea id="zmp-text" spellcheck="false" '+
+        'style="width:100%;min-height:220px;background:#0a0f15;color:var(--txt);'+
+        'border:1px solid var(--line);border-radius:4px;padding:8px;'+
+        'font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;'+
+        'line-height:1.4;resize:vertical">'+esc(content)+'</textarea>'+
+      '<div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
+        '<button class="vbbtn vbbtnp" id="zmp-save">Сохранить</button>'+
+        '<button class="vbbtn" id="zmp-reload">Перечитать</button>'+
+        '<span id="zmp-msg" style="font-size:12.5px;color:var(--dim)"></span>'+
+      '</div>'+
+    '</div></div>';
+  el("zmp-reload").addEventListener("click",function(){
+    _zmp.loaded=false; renderZfsModparams();
+  });
+  el("zmp-save").addEventListener("click",_zmpSave);
+}
+function _zmpSave(){
+  if(_zmp.busy) return;
+  var ta=el("zmp-text"); if(!ta) return;
+  var content=ta.value;
+  var msg=el("zmp-msg"); msg.style.color="var(--dim)"; msg.textContent="сохранение…";
+  _zmp.busy=true; el("zmp-save").disabled=true;
+  fetch("/api/zfs/modparams",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({confirm:"modparams",content:content})
+  }).then(function(r){return r.json();}).then(function(j){
+    _zmp.busy=false; el("zmp-save").disabled=false;
+    if(j&&j.ok){
+      msg.style.color="var(--accent)";
+      var tail=j.backup?(" Бэкап: "+j.backup):"";
+      msg.textContent=(j.msg||"сохранено")+tail;
+      _zmp.loaded=false; renderZfsModparams();
+    }else{
+      msg.style.color="var(--no)";
+      msg.textContent=(j&&(j.msg||j.error))||"ошибка сохранения";
+    }
+  }).catch(function(e){
+    _zmp.busy=false; el("zmp-save").disabled=false;
+    msg.style.color="var(--no)"; msg.textContent="ошибка связи: "+e;
+  });
+}
 
 /* ===== попап SMART диска ===== */
 var sm=null;
@@ -8023,6 +8248,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/zfs/cache":
             self._send(200, "application/json",
                        json.dumps(zfs_cache_info()).encode("utf-8"))
+        elif path == "/api/zfs/modparams":
+            self._send(200, "application/json",
+                       json.dumps(zfs_modparams_info()).encode("utf-8"))
         elif path == "/api/service/info":
             self._send(200, "application/json",
                        json.dumps(service_info()).encode("utf-8"))
@@ -8064,8 +8292,8 @@ class Handler(BaseHTTPRequestHandler):
                         "/api/install/vitastor", "/api/install/controlplane",
                         "/api/cluster/apply", "/api/node/join",
                         "/api/node/prepare-disk", "/api/zfs/create",
-                        "/api/zfs/cache", "/api/service/timer",
-                        "/api/service/stop"):
+                        "/api/zfs/cache", "/api/zfs/modparams",
+                        "/api/service/timer", "/api/service/stop"):
             self._send(404, "text/plain; charset=utf-8",
                        "не найдено".encode("utf-8"))
             return
@@ -8173,6 +8401,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json",
                        json.dumps(resp).encode("utf-8"))
             return
+        if path == "/api/zfs/modparams":
+            if (req.get("confirm") or "") != "modparams":
+                self._send(200, "application/json", json.dumps(
+                    {"error": "подтверждение не получено (нужно: modparams)"}
+                ).encode("utf-8"))
+                return
+            with _wiz_lock:
+                resp = zfs_modparams_save(req.get("content"))
+            self._send(200, "application/json",
+                       json.dumps(resp).encode("utf-8"))
+            return
         if path == "/api/zfs/create":
             name = (req.get("name") or "").strip()
             if not name or (req.get("confirm") or "").strip() != name:
@@ -8181,7 +8420,8 @@ class Handler(BaseHTTPRequestHandler):
                 ).encode("utf-8"))
                 return
             with _wiz_lock:
-                resp = zfs_create_pool(name, req.get("mode"), req.get("disks"))
+                resp = zfs_create_pool(name, req.get("mode"),
+                                       req.get("disks"), req.get("width"))
             with _lock:
                 _cache["ts"] = 0.0
             self._send(200, "application/json",
