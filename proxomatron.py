@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.31"
+VERSION = "0.1.39"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -284,7 +284,10 @@ def sampler_loop():
         arc = read_arcstats()
         if arc and "size" in arc:
             with _series_lock:
-                _arc_series.append({"t": round(now, 1), "size": arc["size"]})
+                _arc_series.append({"t": round(now, 1),
+                                    "size": arc.get("size"),
+                                    "c": arc.get("c"),
+                                    "dirty": read_dirty_data()})
         time.sleep(1.0)
 
 
@@ -417,6 +420,36 @@ def zpool_topology():
     return res
 
 
+def read_dirty_data():
+    """Сумма ndirty по всем in-flight txg (state != C) по всем ZFS-пулам, байты."""
+    total = 0
+    try:
+        base = "/proc/spl/kstat/zfs"
+        for pool in os.listdir(base):
+            txgs = base + "/" + pool + "/txgs"
+            if not os.path.exists(txgs):
+                continue
+            try:
+                with open(txgs) as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+            for raw in lines[2:]:
+                parts = raw.split()
+                if len(parts) < 4:
+                    continue
+                state = parts[2]
+                if state == "C":
+                    continue
+                try:
+                    total += int(parts[3])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
 def arc_info():
     # сводка кэша ZFS ARC + временной ряд размера
     cur = read_arcstats()
@@ -427,6 +460,7 @@ def arc_info():
     tot = hits + misses
     with _series_lock:
         series = list(_arc_series)
+    dirty_max = _read_int_file(ZFS_DIRTY_MAX) if os.path.exists(ZFS_DIRTY_MAX) else None
     return {
         "present": True,
         "size": cur.get("size"),
@@ -438,6 +472,8 @@ def arc_info():
         "hit_ratio": round(hits / tot * 100.0, 1) if tot else None,
         "data_size": cur.get("data_size"),
         "metadata_size": cur.get("metadata_size"),
+        "dirty": read_dirty_data(),
+        "dirty_max": dirty_max,
         "series": series,
     }
 
@@ -495,6 +531,8 @@ ZFS_MODES = {
                "needs_width": False},
     "zr2":    {"label": "RAIDZ2", "min": 4, "max": ZFS_MAX_DISKS,
                "needs_width": False},
+    "zr3":    {"label": "RAIDZ3", "min": 5, "max": ZFS_MAX_DISKS,
+               "needs_width": False},
 }
 
 
@@ -508,6 +546,8 @@ def _zfs_vdev(mode, dpaths, width):
         return ["raidz1"] + list(dpaths)
     if mode == "zr2":
         return ["raidz2"] + list(dpaths)
+    if mode == "zr3":
+        return ["raidz3"] + list(dpaths)
     if mode == "raid10":
         out = []
         for i in range(0, len(dpaths), width):
@@ -602,11 +642,14 @@ def zfs_create_pool(name, mode, disks, width=None):
             "msg": "Пул ZFS «%s» создан — %s." % (name, spec["label"])}
 
 
-# ---------- управление кэшем ZFS ARC ----------
-ARC_MIN_BYTES = 128 * 1024 * 1024            # 128 MiB
-ARC_MAX_BYTES = 256 * 1024 * 1024 * 1024     # 256 GiB
+# ---------- управление кэшем ZFS ARC + dirty buffer ----------
+ARC_MIN_BYTES = 512 * 1024 * 1024            # 512 MiB
+ARC_MAX_BYTES = 512 * 1024 * 1024 * 1024     # 512 GiB
+DIRTY_MIN_BYTES = 64 * 1024 * 1024           # 64 MiB
+DIRTY_MAX_BYTES = 64 * 1024 * 1024 * 1024    # 64 GiB
 ZFS_ARC_MAX = "/sys/module/zfs/parameters/zfs_arc_max"
 ZFS_ARC_MIN = "/sys/module/zfs/parameters/zfs_arc_min"
+ZFS_DIRTY_MAX = "/sys/module/zfs/parameters/zfs_dirty_data_max"
 ZFS_MODPROBE = "/etc/modprobe.d/zfs.conf"
 
 
@@ -627,15 +670,19 @@ def _hbytes(n):
 
 
 def zfs_cache_info():
-    """Состояние кэша ZFS ARC для панели управления."""
+    """Состояние кэша ZFS ARC + dirty data buffer для панели управления."""
     arc = read_arcstats()
     present = bool(arc and "size" in arc) and os.path.exists("/sys/module/zfs")
-    persist = None
+    arc_persist = None
+    dirty_persist = None
     try:
         for ln in open(ZFS_MODPROBE):
             m = re.search(r"zfs_arc_max\s*=\s*(\d+)", ln)
             if m:
-                persist = int(m.group(1))
+                arc_persist = int(m.group(1))
+            m = re.search(r"zfs_dirty_data_max\s*=\s*(\d+)", ln)
+            if m:
+                dirty_persist = int(m.group(1))
     except Exception:
         pass
     try:
@@ -649,15 +696,19 @@ def zfs_cache_info():
         "c_max": (arc or {}).get("c_max", 0),
         "c_min": (arc or {}).get("c_min", 0),
         "arc_max_runtime": _read_int_file(ZFS_ARC_MAX) or 0,
-        "arc_max_persist": persist,
+        "arc_max_persist": arc_persist,
+        "dirty_runtime": _read_int_file(ZFS_DIRTY_MAX),
+        "dirty_persist": dirty_persist,
         "total_ram": total_ram,
         "min_allowed": ARC_MIN_BYTES,
         "max_allowed": ARC_MAX_BYTES,
+        "dirty_min": DIRTY_MIN_BYTES,
+        "dirty_max": DIRTY_MAX_BYTES,
     }
 
 
-def zfs_set_cache(bytes_val):
-    """Установить максимальный размер кэша ZFS ARC (runtime + /etc/modprobe.d)."""
+def zfs_set_cache(bytes_val, dirty_bytes_val=None):
+    """Установить максимум ARC и (опц.) zfs_dirty_data_max — runtime + zfs.conf."""
     try:
         b = int(bytes_val)
     except Exception:
@@ -665,10 +716,22 @@ def zfs_set_cache(bytes_val):
                 "msg": "размер кэша должен быть числом"}
     if b < ARC_MIN_BYTES or b > ARC_MAX_BYTES:
         return {"ok": False, "results": [],
-                "msg": "размер кэша вне диапазона 128 MiB – 256 GiB"}
+                "msg": "размер кэша вне диапазона %s – %s"
+                % (_hbytes(ARC_MIN_BYTES), _hbytes(ARC_MAX_BYTES))}
     if not os.path.exists("/sys/module/zfs"):
         return {"ok": False, "results": [],
                 "msg": "модуль ZFS не загружен — управление кэшем недоступно"}
+    db = None
+    if dirty_bytes_val is not None and dirty_bytes_val != "":
+        try:
+            db = int(dirty_bytes_val)
+        except Exception:
+            return {"ok": False, "results": [],
+                    "msg": "размер dirty buffer должен быть числом"}
+        if db < DIRTY_MIN_BYTES or db > DIRTY_MAX_BYTES:
+            return {"ok": False, "results": [],
+                    "msg": "dirty buffer вне диапазона %s – %s"
+                    % (_hbytes(DIRTY_MIN_BYTES), _hbytes(DIRTY_MAX_BYTES))}
     results = []
 
     def emit(title, ok, cmd="", out="", err=""):
@@ -695,22 +758,53 @@ def zfs_set_cache(bytes_val):
         emit("Применение максимума ARC", False, "", "", str(e))
         return {"ok": False, "results": results,
                 "msg": "не удалось записать zfs_arc_max"}
+    if db is not None:
+        try:
+            with open(ZFS_DIRTY_MAX, "w") as f:
+                f.write(str(db))
+            emit("Dirty buffer применён (действует сразу)", True,
+                 "echo %d > %s" % (db, ZFS_DIRTY_MAX), out=_hbytes(db))
+        except Exception as e:
+            emit("Применение zfs_dirty_data_max", False, "", "", str(e))
+            return {"ok": False, "results": results,
+                    "msg": "не удалось записать zfs_dirty_data_max"}
     try:
         lines = []
         if os.path.exists(ZFS_MODPROBE):
             lines = open(ZFS_MODPROBE).read().splitlines()
-        lines = [ln for ln in lines if "zfs_arc_max" not in ln]
-        lines.append("options zfs zfs_arc_max=%d" % b)
+        new_lines = []
+        for ln in lines:
+            m = re.match(r"options\s+zfs\s+(.*)$", ln.strip())
+            if not m:
+                new_lines.append(ln)
+                continue
+            kept = []
+            for tok in m.group(1).split():
+                if "=" in tok:
+                    kt = tok.split("=", 1)[0].strip()
+                    if kt == "zfs_arc_max":
+                        continue
+                    if db is not None and kt == "zfs_dirty_data_max":
+                        continue
+                kept.append(tok)
+            if kept:
+                new_lines.append("options zfs " + " ".join(kept))
+        new_lines.append("options zfs zfs_arc_max=%d" % b)
+        if db is not None:
+            new_lines.append("options zfs zfs_dirty_data_max=%d" % db)
         with open(ZFS_MODPROBE, "w") as f:
-            f.write("\n".join(ln for ln in lines if ln.strip()) + "\n")
-        emit("Сохранено в %s (вступит в силу после перезагрузки)" % ZFS_MODPROBE,
-             True, "options zfs zfs_arc_max=%d" % b)
+            f.write("\n".join(ln for ln in new_lines if ln.strip()) + "\n")
+        emit("Сохранено в %s" % ZFS_MODPROBE, True,
+             "options zfs zfs_arc_max=%d%s" % (b,
+                 (" zfs_dirty_data_max=%d" % db) if db is not None else ""))
     except Exception as e:
         emit("Сохранение в zfs.conf", False, "", "", str(e))
         return {"ok": True, "results": results,
-                "msg": "максимум кэша применён, но не сохранён в конфиг"}
-    return {"ok": True, "results": results,
-            "msg": "Максимум кэша ZFS ARC установлен: %s." % _hbytes(b)}
+                "msg": "значения применены, но не сохранены в конфиг"}
+    msg = "ARC: %s" % _hbytes(b)
+    if db is not None:
+        msg += " · dirty buffer: %s" % _hbytes(db)
+    return {"ok": True, "results": results, "msg": msg}
 
 
 # ---------- тонкие настройки vdev I/O queue + dirty buffer ----------
@@ -727,10 +821,6 @@ ZFS_TUNABLES = [
     {"key": "zfs_vdev_sync_write_max_active",  "label": "Sync write max active",
      "desc": "макс. одновременных синхронных записей на vdev (по умолчанию 10)",
      "kind": "int", "min": 1, "max": 1024, "default": 10},
-    {"key": "zfs_dirty_data_max",              "label": "Dirty data buffer (max)",
-     "desc": "грязный буфер в RAM, байты (типично 1–8 GiB; пример: 4G = 4294967296)",
-     "kind": "bytes", "min": 64 * 1024 * 1024,
-     "max": 64 * 1024 * 1024 * 1024, "default": None},
 ]
 
 
@@ -4448,10 +4538,12 @@ INDEX_HTML = r'''<!DOCTYPE html>
           <button class="wizbtn zfsbig" id="zw-open">&#9874; Мастер пулов ZFS</button>
           <button class="wizbtn zfsbig" id="cl-open">&#10133; Мастер кеш / лог устройств</button>
           <button class="wizbtn zfsbig" id="cc-open">&#9881; Управление кэшем</button></div>
-        <div id="zfs-tunables"></div>
       </div>
       <div class="vtabpane" id="zftab-tuning">
-        <div id="zfs-modparams"></div>
+        <div class="lblrow" style="margin:8px 0 14px;justify-content:flex-start;flex-wrap:wrap">
+          <button class="wizbtn zfsbig" id="tn-open">&#9881; Тонкие параметры ZFS</button>
+          <button class="wizbtn zfsbig" id="mp-open">&#9998; Редактор zfs.conf</button>
+        </div>
       </div>
     </section>
 
@@ -4565,6 +4657,24 @@ INDEX_HTML = r'''<!DOCTYPE html>
   </div>
 </div>
 
+<div class="wizmask" id="tnmask">
+  <div class="wizbox" style="width:820px">
+    <div class="wizhd"><span>Тонкие параметры ZFS (vdev I/O queue + dirty buffer)</span>
+      <span class="wizx" id="tnclose">&times;</span></div>
+    <div class="wizbody" id="tnbody"></div>
+    <div class="wizft" id="tnft"></div>
+  </div>
+</div>
+
+<div class="wizmask" id="mpmask">
+  <div class="wizbox" style="width:820px">
+    <div class="wizhd"><span>Редактор /etc/modprobe.d/zfs.conf</span>
+      <span class="wizx" id="mpclose">&times;</span></div>
+    <div class="wizbody" id="mpbody"></div>
+    <div class="wizft" id="mpft"></div>
+  </div>
+</div>
+
 <div class="wizmask" id="smmask">
   <div class="wizbox" style="width:660px">
     <div class="wizhd"><span id="smtitle">SMART</span>
@@ -4670,8 +4780,6 @@ function setZfsTab(name){
     p.classList.toggle("active", p.id==="zftab-"+name);
   });
   try{ localStorage.setItem("vb_zftab", name); }catch(e){}
-  if(name==="settings" && typeof renderZfsTunables==="function") renderZfsTunables();
-  if(name==="tuning"   && typeof renderZfsModparams==="function") renderZfsModparams();
 }
 document.querySelectorAll("#view-zfs .vtab").forEach(function(t){
   t.addEventListener("click", function(){ setZfsTab(t.getAttribute("data-vtab")); });
@@ -5175,22 +5283,41 @@ function renderZfs(z){
       "<div class=\"et\">ZFS-пулов на этом узле нет</div>"+
       "<div class=\"ed\">Утилиты ZFS установлены, пул можно создать на свободных дисках.</div></div>"; return;
   }
-  var tmap={mirror:"зеркало",raidz1:"RAIDZ1",raidz2:"RAIDZ2",raidz3:"RAIDZ3",
-            stripe:"страйп",single:"одиночный диск",draid:"dRAID"};
-  var arc=z.arc||{}, sizes=[], amax=1, arcHtml="";
+  var tmap={mirror:"mirror",raidz1:"RAIDZ1",raidz2:"RAIDZ2",raidz3:"RAIDZ3",
+            stripe:"stripe",single:"single",draid:"dRAID"};
+  var arc=z.arc||{}, sizes=[], cs=[], drt=[], amax=1, arcHtml="";
   if(arc.present){
-    sizes=(arc.series||[]).map(function(x){return x.size||0;});
-    amax=niceMax(Math.max.apply(null,[1].concat(sizes)));
+    sizes=(arc.series||[]).map(function(x){return x.size ||0;});
+    cs   =(arc.series||[]).map(function(x){return x.c    ||0;});
+    drt  =(arc.series||[]).map(function(x){return x.dirty||0;});
+    amax=niceMax(Math.max.apply(null,[1].concat(sizes,cs,drt)));
     arcHtml="<div class=\"lbl\">Кэш ARC</div>"+
       "<div class=\"graphcard\"><div class=\"gh\">"+
         "<span class=\"gt\">Размер ARC &mdash; окно 60 с</span>"+
         "<span class=\"gv\" style=\"color:var(--accent)\">"+hb(arc.size)+"</span>"+
-        "<span class=\"gmax\">/ "+hb(amax)+"</span></div>"+
+        "<span class=\"gmax\">/ "+hb(amax)+"</span>"+
+        "<span style=\"margin-left:14px;font-size:11.5px;color:var(--dim);"+
+          "display:inline-flex;align-items:center;gap:12px;flex-wrap:wrap\">"+
+          "<span style=\"display:inline-flex;align-items:center;gap:5px\">"+
+            "<span style=\"width:18px;height:3px;background:#38bdf8;"+
+              "display:inline-block;border-radius:2px\"></span>"+
+            "Размер (size)</span>"+
+          "<span style=\"display:inline-flex;align-items:center;gap:5px\">"+
+            "<span style=\"width:18px;height:0;border-top:2px dashed #ffb547;"+
+              "display:inline-block\"></span>"+
+            "Целевой (c)</span>"+
+          "<span style=\"display:inline-flex;align-items:center;gap:5px\">"+
+            "<span style=\"width:18px;height:3px;background:#a47bd0;"+
+              "display:inline-block;border-radius:2px\"></span>"+
+            "Dirty buffer</span>"+
+        "</span>"+
+        "</div>"+
         "<canvas class=\"graph\" id=\"arc-graph\"></canvas></div>"+
       "<div class=\"row r4\" style=\"margin-bottom:14px\">"+
         mstat("Размер ARC",hb(arc.size))+
         mstat("Целевой (c)",hb(arc.c))+
-        mstat("Максимум",hb(arc.c_max))+
+        mstat("Dirty buffer",hb(arc.dirty||0)+
+          (arc.dirty_max?(" / "+hb(arc.dirty_max)):""))+
         mstat("Хит-рейт",(arc.hit_ratio!=null?arc.hit_ratio+"%":"&mdash;"))+
       "</div>";
   }
@@ -5205,12 +5332,16 @@ function renderZfs(z){
 
     var mine=ds.filter(function(x){
       return x.name===p.name||x.name.indexOf(p.name+"/")===0;});
+    var typeMap={filesystem:"dataset",volume:"volume",
+                 snapshot:"snapshot",bookmark:"bookmark"};
     var tbl="<table class=\"zdstbl\"><tr><th>Имя</th><th>Тип</th><th>Занято</th>"+
       "<th>Доступно</th><th>recordsize</th><th>volblocksize</th>"+
       "<th>Точка монтирования</th></tr>";
     if(!mine.length) tbl+="<tr><td colspan=7 class=\"empty\">наборов нет</td></tr>";
     mine.forEach(function(x){
-      tbl+="<tr><td><b>"+x.name+"</b></td><td>"+x.type+"</td><td>"+hb(x.used)+"</td>"+
+      tbl+="<tr><td><b>"+x.name+"</b></td>"+
+        "<td>"+(typeMap[x.type]||x.type||"&mdash;")+"</td>"+
+        "<td>"+hb(x.used)+"</td>"+
         "<td>"+hb(x.avail)+"</td>"+
         "<td>"+(x.recordsize?hb(x.recordsize):"&mdash;")+"</td>"+
         "<td>"+(x.volblocksize?hb(x.volblocksize):"&mdash;")+"</td>"+
@@ -5251,7 +5382,31 @@ function renderZfs(z){
       tree+"</div>";
   });
   box.innerHTML=h;
-  if(arc.present){ var cv=el("arc-graph"); if(cv) drawArea(cv,sizes,"#38bdf8",amax); }
+  if(arc.present){
+    function _arcOverlay(cv, ser, ymax, color, dashed){
+      if(!cv||!ser||!ser.length||!(ymax>0)) return;
+      var ctx=cv.getContext("2d");
+      var w=cv.width, h=cv.height, N=60, off=N-ser.length;
+      ctx.save();
+      ctx.beginPath();
+      for(var j=0;j<ser.length;j++){
+        var fx=(off+j)/(N-1)*w;
+        var fy=h-Math.min(ser[j],ymax)/ymax*(h-3)-1;
+        if(j) ctx.lineTo(fx,fy); else ctx.moveTo(fx,fy);
+      }
+      ctx.strokeStyle=color;
+      ctx.lineWidth=1.6; ctx.lineJoin="round";
+      if(dashed) ctx.setLineDash([5,3]);
+      ctx.stroke();
+      ctx.restore();
+    }
+    var cv=el("arc-graph");
+    if(cv){
+      drawArea(cv,sizes,"#38bdf8",amax);
+      _arcOverlay(cv, cs,  amax, "#ffb547", true);   // Целевой (c) — пунктир
+      _arcOverlay(cv, drt, amax, "#a47bd0", false);  // Dirty buffer — сплошная
+    }
+  }
 }
 
 /* ---- ceph ---- */
@@ -6498,7 +6653,8 @@ var ZW_MODES=[
   {id:"mirror",ic:"&#9636;",nm:"Зеркало",  ad:"одно зеркало 2/3/4-way",                min:2,max:4,    width:true},
   {id:"raid10",ic:"&#9707;",nm:"RAID10",   ad:"страйп из зеркал, до 24 дисков",        min:4,max:ZW_MAX,width:true},
   {id:"zr1",   ic:"&#9638;",nm:"RAIDZ1",   ad:"1 диск чётности, мин. 3",               min:3,max:ZW_MAX,width:false},
-  {id:"zr2",   ic:"&#9638;",nm:"RAIDZ2",   ad:"2 диска чётности, мин. 4",              min:4,max:ZW_MAX,width:false}
+  {id:"zr2",   ic:"&#9638;",nm:"RAIDZ2",   ad:"2 диска чётности, мин. 4",              min:4,max:ZW_MAX,width:false},
+  {id:"zr3",   ic:"&#9638;",nm:"RAIDZ3",   ad:"3 диска чётности, мин. 5",              min:5,max:ZW_MAX,width:false}
 ];
 function zwMode(id){
   for(var i=0;i<ZW_MODES.length;i++) if(ZW_MODES[i].id===id) return ZW_MODES[i];
@@ -6533,6 +6689,7 @@ function zwVdev(){
   if(zw.mode==="mirror") return "mirror "+d.join(" ");
   if(zw.mode==="zr1") return "raidz1 "+d.join(" ");
   if(zw.mode==="zr2") return "raidz2 "+d.join(" ");
+  if(zw.mode==="zr3") return "raidz3 "+d.join(" ");
   if(zw.mode==="raid10"){
     var parts=[]; for(var i=0;i<d.length;i+=w)
       parts.push("mirror "+d.slice(i,i+w).join(" "));
@@ -6768,10 +6925,11 @@ el("zwmask").addEventListener("click",function(e){
   if(e.target===this&&zw&&!zw.busy) zwClose();
 });
 
-/* ===== Управление кэшем ZFS ARC ===== */
+/* ===== Управление кэшем ZFS ARC + dirty data buffer ===== */
 var cc=null;
 function ccOpen(){
-  cc={info:null,busy:false,result:null,err:"",val:"",unit:"GiB"};
+  cc={info:null,busy:false,result:null,err:"",
+      val:"",unit:"GiB", dval:"",dunit:"GiB"};
   el("ccmask").style.display="flex";
   el("ccbody").innerHTML="<div class=\"wizhint\">Загрузка состояния кэша…</div>";
   el("ccft").innerHTML="";
@@ -6783,23 +6941,37 @@ function ccOpen(){
     });
 }
 function ccClose(){ if(cc&&cc.busy) return; el("ccmask").style.display="none"; cc=null; }
-function ccInit(){
-  var i=cc.info||{}, cur=i.arc_max_runtime||i.c_max||0;
-  if(cur>=1073741824){
-    var g=cur/1073741824;
-    cc.val=String(g%1?g.toFixed(1):g.toFixed(0)); cc.unit="GiB";
-  } else {
-    cc.val=String(Math.max(128,Math.round(cur/1048576))); cc.unit="MiB";
+function _ccFmtVal(bytes){
+  if(!bytes) return {val:"", unit:"GiB"};
+  if(bytes>=1073741824){
+    var g=bytes/1073741824;
+    return {val:String(g%1?g.toFixed(1):g.toFixed(0)), unit:"GiB"};
   }
+  return {val:String(Math.max(1, Math.round(bytes/1048576))), unit:"MiB"};
 }
-function ccBytes(){
-  var v=parseFloat(String(cc.val).replace(",","."));
+function ccInit(){
+  var i=cc.info||{};
+  var a=_ccFmtVal(i.arc_max_runtime||i.c_max||0);
+  cc.val=a.val; cc.unit=a.unit;
+  var d=_ccFmtVal(i.dirty_runtime||0);
+  cc.dval=d.val; cc.dunit=d.unit;
+}
+function _ccBytes(val, unit){
+  var v=parseFloat(String(val).replace(",","."));
   if(isNaN(v)||v<=0) return 0;
-  return Math.round(v*(cc.unit==="GiB"?1073741824:1048576));
+  return Math.round(v*(unit==="GiB"?1073741824:1048576));
 }
+function ccBytes(){      return _ccBytes(cc.val,  cc.unit);  }
+function ccDirtyBytes(){ return _ccBytes(cc.dval, cc.dunit); }
 function ccValid(){
-  var b=ccBytes(), i=cc.info||{};
-  return i.present!==false&&b>=(i.min_allowed||0)&&b<=(i.max_allowed||0);
+  var i=cc.info||{};
+  if(i.present===false) return false;
+  var b=ccBytes();
+  if(b<(i.min_allowed||0) || b>(i.max_allowed||0)) return false;
+  var db=ccDirtyBytes();
+  if(db===0) return true;  // dirty опционален
+  if(db<(i.dirty_min||0) || db>(i.dirty_max||0)) return false;
+  return true;
 }
 function ccBodyForm(){
   var i=cc.info||{};
@@ -6812,9 +6984,14 @@ function ccBodyForm(){
     "Занято кэшем сейчас: <b>"+hb(i.size)+"</b><br>"+
     "Действующий максимум ARC: <b>"+hb(eff)+"</b>"+
       (i.arc_max_runtime?"":" (авто)")+"<br>"+
-    "В конфиге zfs.conf: <b>"+
-      (i.arc_max_persist?hb(i.arc_max_persist):"не задан")+"</b><br>"+
+    "В конфиге zfs.conf: ARC = <b>"+
+      (i.arc_max_persist?hb(i.arc_max_persist):"не задан")+"</b>"+
+      ", dirty = <b>"+
+      (i.dirty_persist?hb(i.dirty_persist):"не задан")+"</b><br>"+
+    "Действующий dirty buffer: <b>"+
+      (i.dirty_runtime?hb(i.dirty_runtime):"авто")+"</b><br>"+
     "Всего ОЗУ на узле: <b>"+hb(i.total_ram)+"</b></div></div>";
+  // --- ARC ---
   h+="<div class=\"wizgrp\"><div class=\"gl\">Новый максимум кэша ARC</div>"+
      "<div class=\"wizfld\"><label>Размер кэша</label>"+
      "<input class=\"wizinp\" id=\"cc-val\" value=\""+wizEsc(cc.val)+
@@ -6825,17 +7002,39 @@ function ccBodyForm(){
      "</select><span id=\"cc-eff\" style=\"margin-left:8px;font-size:12px\"></span>"+
      "</div>"+
      "<div class=\"wizhint\" style=\"margin-left:180px\">допустимый диапазон "+
-       "128 MiB – 256 GiB</div>"+
+       hb(i.min_allowed||0)+" – "+hb(i.max_allowed||0)+"</div>"+
      "<div style=\"margin:9px 0 0 180px;display:flex;gap:6px;flex-wrap:wrap\">";
-  [["256","MiB"],["512","MiB"],["1","GiB"],["4","GiB"],["16","GiB"],
-   ["64","GiB"]].forEach(function(p){
+  [["512","MiB"],["1","GiB"],["4","GiB"],["16","GiB"],
+   ["64","GiB"],["256","GiB"],["512","GiB"]].forEach(function(p){
     h+="<span class=\"tagchip\" style=\"cursor:pointer;padding:3px 9px\" "+
        "data-ccpreset=\""+p[0]+"|"+p[1]+"\">"+p[0]+"&nbsp;"+p[1]+"</span>";
   });
   h+="</div></div>";
-  h+="<div class=\"wizhint\">Новый максимум действует сразу; запись в "+
-     "/etc/modprobe.d/zfs.conf вступит в силу после следующей загрузки "+
-     "модуля ZFS (перезагрузка узла).</div>";
+  // --- Dirty data buffer ---
+  h+="<div class=\"wizgrp\"><div class=\"gl\">Dirty data buffer (max)</div>"+
+     "<div class=\"wizhint\" style=\"margin:0 0 6px 4px\">"+
+       "Грязный буфер в RAM (<code>zfs_dirty_data_max</code>) — "+
+       "буфер для накопления записи перед сбросом на vdev. Оставьте поле "+
+       "пустым, чтобы не менять.</div>"+
+     "<div class=\"wizfld\"><label>Размер буфера</label>"+
+     "<input class=\"wizinp\" id=\"cc-dval\" value=\""+wizEsc(cc.dval)+
+       "\" style=\"flex:none;width:110px\" autocomplete=\"off\" placeholder=\"не менять\">"+
+     "<select class=\"wizsel\" id=\"cc-dunit\" style=\"flex:none;width:84px\">"+
+       "<option"+(cc.dunit==="MiB"?" selected":"")+">MiB</option>"+
+       "<option"+(cc.dunit==="GiB"?" selected":"")+">GiB</option>"+
+     "</select><span id=\"cc-deff\" style=\"margin-left:8px;font-size:12px\"></span>"+
+     "</div>"+
+     "<div class=\"wizhint\" style=\"margin-left:180px\">допустимый диапазон "+
+       hb(i.dirty_min||0)+" – "+hb(i.dirty_max||0)+"</div>"+
+     "<div style=\"margin:9px 0 0 180px;display:flex;gap:6px;flex-wrap:wrap\">";
+  [["1","GiB"],["2","GiB"],["4","GiB"],["8","GiB"],
+   ["16","GiB"],["32","GiB"]].forEach(function(p){
+    h+="<span class=\"tagchip\" style=\"cursor:pointer;padding:3px 9px\" "+
+       "data-ccdirty=\""+p[0]+"|"+p[1]+"\">"+p[0]+"&nbsp;"+p[1]+"</span>";
+  });
+  h+="</div></div>";
+  h+="<div class=\"wizhint\">Новые значения действуют сразу; запись в "+
+     "/etc/modprobe.d/zfs.conf сохраняется как <code>options zfs ...</code>.</div>";
   return h;
 }
 function ccBodyResult(){
@@ -6855,21 +7054,41 @@ function ccBodyResult(){
   return h;
 }
 function ccUpdateEff(){
-  var s=el("cc-eff"); if(!s) return;
-  var b=ccBytes();
-  if(!b){ s.textContent=""; }
-  else if(!ccValid()){ s.style.color="var(--no)"; s.textContent="вне диапазона"; }
-  else { s.style.color="var(--dim)"; s.textContent="= "+hb(b); }
+  var i=cc.info||{};
+  var sa=el("cc-eff");
+  if(sa){
+    var b=ccBytes();
+    if(!b){ sa.textContent=""; }
+    else if(b<(i.min_allowed||0)||b>(i.max_allowed||0)){
+      sa.style.color="var(--no)"; sa.textContent="вне диапазона";
+    } else { sa.style.color="var(--dim)"; sa.textContent="= "+hb(b); }
+  }
+  var sd=el("cc-deff");
+  if(sd){
+    var db=ccDirtyBytes();
+    if(!db){ sd.style.color="var(--dim)"; sd.textContent="не менять"; }
+    else if(db<(i.dirty_min||0)||db>(i.dirty_max||0)){
+      sd.style.color="var(--no)"; sd.textContent="вне диапазона";
+    } else { sd.style.color="var(--dim)"; sd.textContent="= "+hb(db); }
+  }
   ccFooter();
 }
 function ccBind(){
   var b;
-  if(b=el("cc-val")) b.oninput=function(){ cc.val=this.value; ccUpdateEff(); };
-  if(b=el("cc-unit")) b.onchange=function(){ cc.unit=this.value; ccUpdateEff(); };
+  if(b=el("cc-val"))   b.oninput =function(){ cc.val=this.value; ccUpdateEff(); };
+  if(b=el("cc-unit"))  b.onchange=function(){ cc.unit=this.value; ccUpdateEff(); };
+  if(b=el("cc-dval"))  b.oninput =function(){ cc.dval=this.value; ccUpdateEff(); };
+  if(b=el("cc-dunit")) b.onchange=function(){ cc.dunit=this.value; ccUpdateEff(); };
   document.querySelectorAll("[data-ccpreset]").forEach(function(c){
     c.onclick=function(){
       var p=c.getAttribute("data-ccpreset").split("|");
       cc.val=p[0]; cc.unit=p[1]; ccRender();
+    };
+  });
+  document.querySelectorAll("[data-ccdirty]").forEach(function(c){
+    c.onclick=function(){
+      var p=c.getAttribute("data-ccdirty").split("|");
+      cc.dval=p[0]; cc.dunit=p[1]; ccRender();
     };
   });
 }
@@ -6904,11 +7123,13 @@ function ccRender(){
 }
 function ccApply(){
   if(!cc||!ccValid()) return;
-  var b=ccBytes();
+  var b=ccBytes(), db=ccDirtyBytes();
+  var payload={confirm:"cache",bytes:b};
+  if(db) payload.dirty_bytes=db;
   cc.busy=true; cc.err=""; cc.result=null; ccRender();
   fetch("/api/zfs/cache",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({confirm:"cache",bytes:b})})
+    body:JSON.stringify(payload)})
     .then(function(r){return r.json();})
     .then(function(d){ cc.busy=false; cc.result=d; ccRender(); })
     .catch(function(e){
@@ -7135,20 +7356,20 @@ el("clmask").addEventListener("click",function(e){
   if(e.target===this&&cl&&!cl.busy) clClose();
 });
 
-/* ===== Тонкие параметры ZFS: vdev I/O queue + dirty buffer ===== */
-var _ztn={data:null,busy:false};
-function _ztnParseBytes(s){
+/* ===== Тонкие параметры ZFS: vdev I/O queue + dirty buffer (модал) ===== */
+var _tn={data:null,busy:false,result:null};
+function _tnParseBytes(s){
   if(s==null) return NaN;
   s=String(s).trim().replace(/\s+/g,"");
   if(s==="") return NaN;
   var m=s.match(/^(\d+(?:[.,]\d+)?)([KMGTkmgt])?(i?B)?$/);
-  if(!m) return Number(s); // raw digits
+  if(!m) return Number(s);
   var v=parseFloat(m[1].replace(",",".")),
       u=(m[2]||"").toUpperCase(),
       mul=({"":1,K:1024,M:1048576,G:1073741824,T:1099511627776})[u];
   return Math.round(v*mul);
 }
-function _ztnFmtBytes(b){
+function _tnFmtBytes(b){
   if(b==null||!isFinite(b)) return "—";
   var n=+b;
   if(n>=1073741824) return (n/1073741824).toFixed(2)+" GiB";
@@ -7156,42 +7377,57 @@ function _ztnFmtBytes(b){
   if(n>=1024)       return (n/1024).toFixed(1)+" KiB";
   return n+" B";
 }
-function renderZfsTunables(){
-  var root=el("zfs-tunables"); if(!root) return;
-  if(!_ztn.data){
-    root.innerHTML='<div class="panel"><div class="lbl">'+
-      'Тонкие параметры ZFS</div>'+
-      '<div style="padding:10px 12px;color:var(--dim)">загрузка&hellip;</div></div>';
-  }
+function tnOpen(){
+  _tn={data:null,busy:false,result:null};
+  el("tnmask").style.display="flex";
+  el("tnbody").innerHTML="<div class=\"wizhint\">Загрузка параметров…</div>";
+  el("tnft").innerHTML="";
+  _tnFetch();
+}
+function tnClose(){
+  if(_tn&&_tn.busy) return;
+  el("tnmask").style.display="none"; _tn={data:null,busy:false,result:null};
+}
+function _tnFetch(){
   fetch("/api/zfs/tunables",{cache:"no-store"})
     .then(function(r){return r.json();})
-    .then(function(d){ _ztn.data=d; _ztnDraw(); })
+    .then(function(d){ _tn.data=d; _tnRender(); })
     .catch(function(e){
-      root.innerHTML='<div class="panel"><div class="lbl">'+
-        'Тонкие параметры ZFS</div><div class="err" style="margin:10px 12px">'+
-        'ошибка: '+esc(String(e))+'</div></div>';
+      el("tnbody").innerHTML="<div class=\"wizerr\">Не удалось загрузить "+
+        "параметры: "+esc(String(e))+"</div>";
     });
 }
-function _ztnDraw(){
-  var root=el("zfs-tunables"); if(!root) return;
-  var d=_ztn.data||{};
-  if(!d.module_loaded){
-    root.innerHTML='<div class="panel"><div class="lbl">'+
-      'Тонкие параметры ZFS</div>'+
-      '<div class="err" style="margin:10px 12px">модуль ZFS не загружен — '+
-      'параметры недоступны.</div></div>';
-    return;
-  }
+function _tnBodyResult(){
+  var r=_tn.result;
+  if(!r) return "";
+  if(r.error) return "<div class=\"wizerr\">"+wizEsc(r.error)+"</div>";
+  var h=(r.ok?"<div class=\"wizok\">&#10003; "+wizEsc(r.msg)+"</div>"
+             :"<div class=\"wizerr\">&#9888; "+wizEsc(r.msg)+"</div>");
+  if(r.backup) h+="<div class=\"wizhint\">Бэкап: <code>"+wizEsc(r.backup)+"</code></div>";
+  (r.results||[]).forEach(function(s){
+    h+="<div class=\"resrow "+(s.ok?"ok":"bad")+"\"><div class=\"rt\">"+
+       (s.ok?"&#10003; ":"&#10007; ")+wizEsc(s.title)+"</div>";
+    if(s.cmd) h+="<div class=\"ro\">$ "+wizEsc(s.cmd)+"</div>";
+    if(s.out) h+="<div class=\"ro\">"+wizEsc(s.out)+"</div>";
+    if(s.err) h+="<div class=\"ro re\">"+wizEsc(s.err)+"</div>";
+    h+="</div>";
+  });
+  return h;
+}
+function _tnBodyForm(){
+  var d=_tn.data||{};
+  if(!d.module_loaded)
+    return "<div class=\"wizerr\">Модуль ZFS не загружен — параметры недоступны.</div>";
   var rows="";
   (d.params||[]).forEach(function(p){
     var rt=(p.runtime!=null?p.runtime:"");
     var rtView=(p.runtime==null?"—"
-                :(p.kind==="bytes"?_ztnFmtBytes(p.runtime)+" ("+p.runtime+")"
+                :(p.kind==="bytes"?_tnFmtBytes(p.runtime)+" ("+p.runtime+")"
                                   :String(p.runtime)));
     var psView=(p.persist==null?"—"
-                :(p.kind==="bytes"?_ztnFmtBytes(p.persist)+" ("+p.persist+")"
+                :(p.kind==="bytes"?_tnFmtBytes(p.persist)+" ("+p.persist+")"
                                   :String(p.persist)));
-    var ph=(p.kind==="bytes"?"например: 4G или 4294967296":String(p.default||""));
+    var ph=(p.kind==="bytes"?"например: 4G":String(p.default||""));
     var width=(p.kind==="bytes"?"170px":"110px");
     rows+='<tr>'+
       '<td><div><b>'+esc(p.label)+'</b></div>'+
@@ -7199,106 +7435,119 @@ function _ztnDraw(){
         '</code> &middot; '+esc(p.desc)+'</div></td>'+
       '<td style="white-space:nowrap"><code>'+esc(rtView)+'</code></td>'+
       '<td style="white-space:nowrap"><code>'+esc(psView)+'</code></td>'+
-      '<td><input class="wizinp ztn-inp" data-zkey="'+esc(p.key)+
+      '<td><input class="wizinp tn-inp" data-zkey="'+esc(p.key)+
         '" data-zkind="'+esc(p.kind)+'" value="'+esc(String(rt))+
         '" placeholder="'+esc(ph)+'" style="width:'+width+';padding:6px 8px;'+
         'font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px" '+
         'autocomplete="off"></td>'+
       '</tr>';
   });
-  root.innerHTML=
-    '<div class="panel">'+
-      '<div class="lbl">Тонкие параметры ZFS (vdev I/O queue + dirty buffer)</div>'+
-      '<div style="padding:10px 12px">'+
-        '<div class="sd" style="margin-bottom:8px">'+
-          'Значения применяются мгновенно к загруженному модулю '+
-          '<code>/sys/module/zfs/parameters/&hellip;</code> и сохраняются в '+
-          '<code>'+esc(d.path||"/etc/modprobe.d/zfs.conf")+
-          '</code> для применения при следующей загрузке.</div>'+
-        '<table class="kvtbl" style="font-size:12.5px">'+
-          '<tr><th>Параметр</th><th>Runtime</th><th>В zfs.conf</th>'+
-            '<th>Новое значение</th></tr>'+
-          rows+
-        '</table>'+
-        '<div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
-          '<button class="vbbtn vbbtnp" id="ztn-apply">Применить и сохранить</button>'+
-          '<button class="vbbtn" id="ztn-reload">Перечитать</button>'+
-          '<span id="ztn-msg" style="font-size:12.5px;color:var(--dim)"></span>'+
-        '</div>'+
-      '</div>'+
-    '</div>';
-  el("ztn-reload").addEventListener("click",function(){
-    _ztn.data=null; renderZfsTunables();
-  });
-  el("ztn-apply").addEventListener("click",_ztnApply);
+  return '<div class="wizhint" style="margin-bottom:8px">'+
+    'Значения применяются мгновенно к загруженному модулю '+
+    '<code>/sys/module/zfs/parameters/&hellip;</code> и сохраняются в '+
+    '<code>'+esc(d.path||"/etc/modprobe.d/zfs.conf")+
+    '</code>. Бэкап создаётся автоматически.</div>'+
+    '<table class="kvtbl" style="font-size:12.5px">'+
+      '<tr><th>Параметр</th><th>Runtime</th><th>В zfs.conf</th>'+
+        '<th>Новое значение</th></tr>'+
+      rows+
+    '</table>';
 }
-function _ztnApply(){
-  if(_ztn.busy) return;
-  var d=_ztn.data||{};
-  var values={};
-  var msg=el("ztn-msg"); msg.style.color="var(--dim)"; msg.textContent="";
-  var bad=null;
+function _tnRender(){
+  if(!_tn) return;
+  var body;
+  if(_tn.busy) body="<div class=\"wizhint\">Применение параметров… не закрывайте окно.</div>";
+  else if(_tn.result) body=_tnBodyResult();
+  else body=_tnBodyForm();
+  el("tnbody").innerHTML=body;
+  _tnFooter();
+}
+function _tnFooter(){
+  if(_tn.busy){ el("tnft").innerHTML=""; return; }
+  if(_tn.result){
+    el("tnft").innerHTML="<div class=\"sp\"></div>"+
+      "<button class=\"wzb pri\" id=\"tn-done\">Закрыть</button>";
+    var d=el("tn-done"); if(d) d.onclick=tnClose;
+    return;
+  }
+  var d=_tn.data||{};
+  var canApply=!!d.module_loaded;
+  el("tnft").innerHTML="<div class=\"sp\"></div>"+
+    "<button class=\"wzb\" id=\"tn-cancel\">Отмена</button>"+
+    "<button class=\"wzb pri\" id=\"tn-apply\""+(canApply?"":" disabled")+
+      ">Применить и сохранить</button>";
+  var x;
+  if(x=el("tn-cancel")) x.onclick=tnClose;
+  if(x=el("tn-apply"))  x.onclick=_tnApply;
+}
+function _tnApply(){
+  if(_tn.busy) return;
+  var d=_tn.data||{};
+  var values={}, bad=null;
   (d.params||[]).forEach(function(p){
     if(bad) return;
-    var inp=document.querySelector('.ztn-inp[data-zkey="'+p.key+'"]');
+    var inp=document.querySelector('.tn-inp[data-zkey="'+p.key+'"]');
     if(!inp) return;
     var raw=inp.value.trim();
-    if(raw==="") return;  // пропускаем пустые
-    var n=(p.kind==="bytes")?_ztnParseBytes(raw):Number(raw);
-    if(!isFinite(n) || Math.floor(n)!==n){
+    if(raw==="") return;
+    var n=(p.kind==="bytes")?_tnParseBytes(raw):Number(raw);
+    if(!isFinite(n)||Math.floor(n)!==n){
       bad=p.label+": некорректное значение «"+raw+"»"; return;
     }
     if(p.min!=null && n<p.min){ bad=p.label+": минимум "+p.min; return; }
     if(p.max!=null && n>p.max){ bad=p.label+": максимум "+p.max; return; }
     if(p.runtime!==n) values[p.key]=n;
   });
-  if(bad){ msg.style.color="var(--no)"; msg.textContent=bad; return; }
-  if(!Object.keys(values).length){
-    msg.style.color="var(--dim)"; msg.textContent="нет изменений"; return;
+  if(bad){
+    el("tnbody").insertAdjacentHTML("afterbegin",
+      "<div class=\"wizerr\">"+wizEsc(bad)+"</div>");
+    return;
   }
-  _ztn.busy=true; el("ztn-apply").disabled=true;
-  msg.textContent="применение…";
+  if(!Object.keys(values).length){
+    el("tnbody").insertAdjacentHTML("afterbegin",
+      "<div class=\"wizhint\">Нет изменений.</div>");
+    return;
+  }
+  _tn.busy=true; _tn.result=null; _tnRender();
   fetch("/api/zfs/tunables",{method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({confirm:"tunables",values:values})})
     .then(function(r){return r.json();}).then(function(j){
-      _ztn.busy=false; el("ztn-apply").disabled=false;
-      if(j&&j.ok){
-        msg.style.color="var(--accent)";
-        var tail=j.backup?(" Бэкап: "+j.backup):"";
-        msg.textContent=(j.msg||"сохранено")+tail;
-        _ztn.data=null; renderZfsTunables();
-      }else{
-        msg.style.color="var(--no)";
-        msg.textContent=(j&&(j.msg||j.error))||"ошибка сохранения";
-      }
+      _tn.busy=false; _tn.result=j; _tnRender();
     }).catch(function(e){
-      _ztn.busy=false; el("ztn-apply").disabled=false;
-      msg.style.color="var(--no)"; msg.textContent="ошибка связи: "+e;
+      _tn.busy=false; _tn.result={error:"Ошибка связи с сервером: "+e}; _tnRender();
     });
 }
+el("tn-open").addEventListener("click",tnOpen);
+el("tnclose").addEventListener("click",tnClose);
+el("tnmask").addEventListener("click",function(e){
+  if(e.target===this&&_tn&&!_tn.busy) tnClose();
+});
 
-/* ===== редактор /etc/modprobe.d/zfs.conf ===== */
-var _zmp={loaded:false,busy:false,data:null};
-function renderZfsModparams(){
-  var root=el("zfs-modparams"); if(!root) return;
-  if(!_zmp.loaded){
-    root.innerHTML='<div class="panel"><div class="lbl">'+
-      'Параметры модуля ZFS (zfs.conf)</div>'+
-      '<div style="padding:10px 12px;color:var(--dim)">загрузка&hellip;</div></div>';
-  }
+/* ===== редактор /etc/modprobe.d/zfs.conf (модал) ===== */
+var _mp={data:null,busy:false,result:null};
+function mpOpen(){
+  _mp={data:null,busy:false,result:null};
+  el("mpmask").style.display="flex";
+  el("mpbody").innerHTML="<div class=\"wizhint\">Загрузка файла…</div>";
+  el("mpft").innerHTML="";
+  _mpFetch();
+}
+function mpClose(){
+  if(_mp&&_mp.busy) return;
+  el("mpmask").style.display="none"; _mp={data:null,busy:false,result:null};
+}
+function _mpFetch(){
   fetch("/api/zfs/modparams",{cache:"no-store"})
     .then(function(r){return r.json();})
-    .then(function(d){ _zmp.data=d; _zmp.loaded=true; _zmpDraw(); })
+    .then(function(d){ _mp.data=d; _mpRender(); })
     .catch(function(e){
-      root.innerHTML='<div class="panel"><div class="lbl">'+
-        'Параметры модуля ZFS</div><div class="err" style="margin:10px 12px">'+
-        'ошибка: '+esc(String(e))+'</div></div>';
+      el("mpbody").innerHTML="<div class=\"wizerr\">Не удалось загрузить файл: "+
+        esc(String(e))+"</div>";
     });
 }
-function _zmpDraw(){
-  var root=el("zfs-modparams"); if(!root) return;
-  var d=_zmp.data||{};
+function _mpBodyForm(){
+  var d=_mp.data||{};
   var parsedRows="";
   (d.parsed||[]).forEach(function(p){
     parsedRows+='<tr><td><code>'+esc(p.key)+'</code></td>'+
@@ -7308,75 +7557,89 @@ function _zmpDraw(){
     ? '<table class="kvtbl" style="margin-top:6px"><tr>'+
         '<th style="width:50%">Параметр</th><th>Значение</th></tr>'+
         parsedRows+'</table>'
-    : '<div class="sd" style="margin-top:6px">в файле нет директив '+
+    : '<div class="wizhint" style="margin-top:6px">в файле нет директив '+
       '<code>options zfs &hellip;</code></div>';
-  var bytes=d.size_bytes||0;
   var modOk=!!d.module_loaded;
   var rtCount=d.runtime_param_count||0;
-  var content=d.content||"";
-  var hint="Файл <code>"+esc(d.path||"/etc/modprobe.d/zfs.conf")+
+  var bytes=d.size_bytes||0;
+  return "<div class=\"wizhint\" style=\"margin-bottom:8px\">"+
+    "Файл <code>"+esc(d.path||"/etc/modprobe.d/zfs.conf")+
     "</code> загружается при инициализации модуля ZFS. "+
     "Допустимые директивы: <code>options</code>, <code>install</code>, "+
     "<code>remove</code>, <code>alias</code>, <code>blacklist</code>, "+
-    "<code>softdep</code>. "+
-    "Изменения вступают в силу после "+
-    "<code>update-initramfs -u</code> и перезагрузки.";
-  var status='модуль zfs: '+(modOk?'<span class="srcok">загружен</span>'
-    :'<span class="srcno">не загружен</span>')+
-    ' &middot; параметров /sys/module/zfs/parameters: <b>'+rtCount+'</b>'+
-    ' &middot; размер файла: <b>'+bytes+'</b> Б';
-  root.innerHTML=
-    '<div class="panel">'+
-    '<div class="lbl">Параметры модуля ZFS (zfs.conf)</div>'+
-    '<div style="padding:10px 12px">'+
-      '<div class="sd" style="margin-bottom:8px">'+hint+'</div>'+
-      '<div class="sd" style="margin-bottom:6px">'+status+'</div>'+
-      '<div class="sd" style="margin:8px 0 4px"><b>Распарсенные options zfs</b></div>'+
-      parsedTbl+
-      '<div class="sd" style="margin:12px 0 4px"><b>Содержимое</b> '+
-        '(до '+(d.max_bytes||65536)+' байт)</div>'+
-      '<textarea id="zmp-text" spellcheck="false" '+
-        'style="width:100%;min-height:220px;background:#0a0f15;color:var(--txt);'+
-        'border:1px solid var(--line);border-radius:4px;padding:8px;'+
-        'font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;'+
-        'line-height:1.4;resize:vertical">'+esc(content)+'</textarea>'+
-      '<div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
-        '<button class="vbbtn vbbtnp" id="zmp-save">Сохранить</button>'+
-        '<button class="vbbtn" id="zmp-reload">Перечитать</button>'+
-        '<span id="zmp-msg" style="font-size:12.5px;color:var(--dim)"></span>'+
-      '</div>'+
-    '</div></div>';
-  el("zmp-reload").addEventListener("click",function(){
-    _zmp.loaded=false; renderZfsModparams();
-  });
-  el("zmp-save").addEventListener("click",_zmpSave);
+    "<code>softdep</code>. Изменения вступают в силу после "+
+    "<code>update-initramfs -u</code> и перезагрузки.</div>"+
+    "<div class=\"wizhint\" style=\"margin-bottom:6px\">"+
+      "модуль zfs: "+(modOk?'<span class="srcok">загружен</span>'
+                            :'<span class="srcno">не загружен</span>')+
+      " &middot; параметров /sys/module/zfs/parameters: <b>"+rtCount+"</b>"+
+      " &middot; размер файла: <b>"+bytes+"</b> Б</div>"+
+    "<div class=\"wizhint\" style=\"margin:8px 0 4px\"><b>Распарсенные options zfs</b></div>"+
+    parsedTbl+
+    "<div class=\"wizhint\" style=\"margin:12px 0 4px\"><b>Содержимое</b> "+
+      "(до "+(d.max_bytes||65536)+" байт)</div>"+
+    "<textarea id=\"mp-text\" spellcheck=\"false\" "+
+      "style=\"width:100%;min-height:240px;background:#0a0f15;color:var(--txt);"+
+      "border:1px solid var(--line);border-radius:4px;padding:8px;"+
+      "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;"+
+      "line-height:1.4;resize:vertical\">"+esc(d.content||"")+"</textarea>";
 }
-function _zmpSave(){
-  if(_zmp.busy) return;
-  var ta=el("zmp-text"); if(!ta) return;
+function _mpBodyResult(){
+  var r=_mp.result;
+  if(!r) return "";
+  if(r.error) return "<div class=\"wizerr\">"+wizEsc(r.error)+"</div>";
+  var h=(r.ok?"<div class=\"wizok\">&#10003; "+wizEsc(r.msg)+"</div>"
+             :"<div class=\"wizerr\">&#9888; "+wizEsc(r.msg)+"</div>");
+  if(r.backup) h+="<div class=\"wizhint\">Бэкап: <code>"+wizEsc(r.backup)+"</code></div>";
+  return h;
+}
+function _mpRender(){
+  if(!_mp) return;
+  var body;
+  if(_mp.busy)        body="<div class=\"wizhint\">Сохранение… не закрывайте окно.</div>";
+  else if(_mp.result) body=_mpBodyResult();
+  else                body=_mpBodyForm();
+  el("mpbody").innerHTML=body;
+  _mpFooter();
+}
+function _mpFooter(){
+  if(_mp.busy){ el("mpft").innerHTML=""; return; }
+  if(_mp.result){
+    el("mpft").innerHTML="<div class=\"sp\"></div>"+
+      "<button class=\"wzb pri\" id=\"mp-done\">Закрыть</button>";
+    var d=el("mp-done"); if(d) d.onclick=mpClose;
+    return;
+  }
+  el("mpft").innerHTML=
+    "<button class=\"wzb\" id=\"mp-reload\">Перечитать</button>"+
+    "<div class=\"sp\"></div>"+
+    "<button class=\"wzb\" id=\"mp-cancel\">Отмена</button>"+
+    "<button class=\"wzb pri\" id=\"mp-save\">Сохранить</button>";
+  var x;
+  if(x=el("mp-reload")) x.onclick=function(){ _mp.data=null; _mp.result=null; _mpFetch(); };
+  if(x=el("mp-cancel")) x.onclick=mpClose;
+  if(x=el("mp-save"))   x.onclick=_mpSave;
+}
+function _mpSave(){
+  if(_mp.busy) return;
+  var ta=el("mp-text"); if(!ta) return;
   var content=ta.value;
-  var msg=el("zmp-msg"); msg.style.color="var(--dim)"; msg.textContent="сохранение…";
-  _zmp.busy=true; el("zmp-save").disabled=true;
-  fetch("/api/zfs/modparams",{
-    method:"POST",
+  _mp.busy=true; _mp.result=null; _mpRender();
+  fetch("/api/zfs/modparams",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({confirm:"modparams",content:content})
-  }).then(function(r){return r.json();}).then(function(j){
-    _zmp.busy=false; el("zmp-save").disabled=false;
-    if(j&&j.ok){
-      msg.style.color="var(--accent)";
-      var tail=j.backup?(" Бэкап: "+j.backup):"";
-      msg.textContent=(j.msg||"сохранено")+tail;
-      _zmp.loaded=false; renderZfsModparams();
-    }else{
-      msg.style.color="var(--no)";
-      msg.textContent=(j&&(j.msg||j.error))||"ошибка сохранения";
-    }
-  }).catch(function(e){
-    _zmp.busy=false; el("zmp-save").disabled=false;
-    msg.style.color="var(--no)"; msg.textContent="ошибка связи: "+e;
-  });
+    body:JSON.stringify({confirm:"modparams",content:content})})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      _mp.busy=false; _mp.result=j; _mpRender();
+    }).catch(function(e){
+      _mp.busy=false; _mp.result={error:"Ошибка связи с сервером: "+e}; _mpRender();
+    });
 }
+el("mp-open").addEventListener("click",mpOpen);
+el("mpclose").addEventListener("click",mpClose);
+el("mpmask").addEventListener("click",function(e){
+  if(e.target===this&&_mp&&!_mp.busy) mpClose();
+});
 
 /* ===== попап SMART диска ===== */
 var sm=null;
@@ -9033,7 +9296,8 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": "подтверждение не получено"}).encode("utf-8"))
                 return
             with _wiz_lock:
-                resp = zfs_set_cache(req.get("bytes"))
+                resp = zfs_set_cache(req.get("bytes"),
+                                     req.get("dirty_bytes"))
             with _lock:
                 _cache["ts"] = 0.0
             self._send(200, "application/json",
