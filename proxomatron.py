@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.4"
+VERSION = "0.1.19"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -289,8 +289,19 @@ def sampler_loop():
 def diskmon():
     with _series_lock:
         series = {k: list(v) for k, v in _series.items()}
+    raw = read_diskstats() or {}
+    counters = {}
+    for name, c in raw.items():
+        counters[name] = {
+            "read_bytes": (c.get("rsect") or 0) * 512,
+            "write_bytes": (c.get("wsect") or 0) * 512,
+            "read_ios": c.get("reads") or 0,
+            "write_ios": c.get("writes") or 0,
+            "ioms": c.get("ioms") or 0,
+        }
     return {"ts": time.time(), "version": VERSION,
-            "disks": disks_info_cached(), "series": series}
+            "disks": disks_info_cached(), "series": series,
+            "counters": counters}
 
 
 # ---------- zfs ----------
@@ -2758,59 +2769,6 @@ def host_vmct():
     }
 
 
-_HOST_SVC_LIST = [
-    "pve-cluster", "pveproxy", "pvedaemon", "pvestatd", "pve-firewall",
-    "pve-ha-crm", "pve-ha-lrm", "pvescheduler", "pvefw-logger",
-    "pve-lxc-syscalld", "corosync", "chrony", "cron", "qmeventd",
-    "spiceproxy", "sshd", "systemd-journald", "ksmtuned", "lxcfs",
-    "postfix", "proxomatron",
-]
-
-
-def host_services():
-    """Состояние ключевых системных служб одним вызовом systemctl show."""
-    args = ["/bin/systemctl", "show", "--no-pager",
-            "-p", "Id", "-p", "ActiveState", "-p", "SubState",
-            "-p", "UnitFileState", "-p", "Description"]
-    args.extend(_HOST_SVC_LIST)
-    r = run_cmd(args, timeout=10)
-    blocks = (r.get("out") or "").split("\n\n")
-    services = []
-    for blk in blocks:
-        d = {}
-        for line in blk.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                d[k] = v
-        name = d.get("Id", "")
-        if name.endswith(".service"):
-            name = name[:-len(".service")]
-        if not name:
-            continue
-        services.append({
-            "name": name,
-            "active": d.get("ActiveState", "?"),
-            "sub": d.get("SubState", ""),
-            "enabled": d.get("UnitFileState", "?"),
-            "desc": d.get("Description", ""),
-        })
-    return {"services": services}
-
-
-def host_journal(service=""):
-    """Последние записи journalctl (опционально с фильтром по службе)."""
-    args = ["/bin/journalctl", "--no-pager", "-n", "200",
-            "-o", "short-iso", "--utc"]
-    if service and re.match(r"^[A-Za-z0-9._@-]+$", service):
-        args += ["-u", service]
-    r = run_cmd(args, timeout=10)
-    return {
-        "service": service or "",
-        "text": r.get("out") or r.get("err") or "",
-        "services": _HOST_SVC_LIST,
-    }
-
-
 _cpu_last_total = None      # последний снимок /proc/stat (агрегат)
 _cpu_last_cores = []        # последние снимки per-core
 _net_last = {"counters": {}, "ts": 0}
@@ -2911,6 +2869,44 @@ def _gpu_devices():
     return devs
 
 
+_vm_vendor_cache = {"v": None, "ts": 0}
+
+
+def _vm_vendor():
+    """Кешированно: DMI sys_vendor (QEMU/VMware/Xen/...) либо 'bare-metal'."""
+    if _vm_vendor_cache["v"] is not None and (time.time() - _vm_vendor_cache["ts"]) < 60:
+        return _vm_vendor_cache["v"]
+    v = _read_file("/sys/devices/virtual/dmi/id/sys_vendor").strip()
+    if not v:
+        v = ""
+    # Если в /proc/cpuinfo есть флаг hypervisor — это VM
+    if not v:
+        hv = "hypervisor" in _read_file("/proc/cpuinfo")
+        v = "VM (hypervisor)" if hv else "bare-metal"
+    _vm_vendor_cache["v"] = v; _vm_vendor_cache["ts"] = time.time()
+    return v
+
+
+def _proc_thread_count():
+    nproc, nthr = 0, 0
+    try:
+        for ent in os.listdir("/proc"):
+            if not ent.isdigit():
+                continue
+            nproc += 1
+            try:
+                with open("/proc/%s/status" % ent) as f:
+                    for line in f:
+                        if line.startswith("Threads:"):
+                            nthr += int(line.split()[1])
+                            break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return nproc, nthr
+
+
 def host_monitor():
     """Снимок системного монитора: CPU/GPU/RAM/Storage/Net/Power.
     Использует diff между вызовами для скоростных метрик (CPU%, bps, ватты)."""
@@ -2996,13 +2992,47 @@ def host_monitor():
                     watts = round(dj / dt, 1)
         _pwr_last = {"uj": uj_now, "ts": now}
 
+    # Доп. инфо для правой панели спецификаций
+    nproc, nthr = _proc_thread_count()
+    uptime_s = None
+    try:
+        uptime_s = float(_read_file("/proc/uptime").split()[0])
+    except Exception:
+        pass
+    base_freq = None
+    v = _read_file("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency").strip()
+    if v.isdigit():
+        try:
+            base_freq = int(v) // 1000
+        except Exception:
+            pass
+    if base_freq is None:
+        # fallback: cpuinfo "cpu MHz" line — это текущая, не базовая, но лучше чем ничего
+        for line in _read_file("/proc/cpuinfo").splitlines():
+            if line.startswith("cpu MHz"):
+                try:
+                    base_freq = int(float(line.split(":",1)[1].strip())); break
+                except Exception:
+                    pass
+
+    # net cumulative — выдаём rx/tx_bytes снимок (для "Всего отправлено/получено")
+    net_counters = {}
+    for k, c in net_now.items():
+        net_counters[k] = {"rx_bytes": c["rx_bytes"], "tx_bytes": c["tx_bytes"],
+                            "rx_packets": c["rx_packets"], "tx_packets": c["tx_packets"]}
+
     return {
         "ts": now,
         "cpu": {
             "model": cpu_model, "cores": cpu_count, "pct": cpu_pct,
             "per_core_pct": per_core, "loadavg": load, "freq_mhz": freqs,
+            "base_freq_mhz": base_freq,
+            "sockets": 1,
+            "vm_vendor": _vm_vendor(),
+            "proc_count": nproc, "thread_count": nthr,
+            "uptime_secs": uptime_s,
         },
-        "ram": {
+        "ram": (lambda _arc=read_arcstats(): {
             "total_kib": mem.get("MemTotal"),
             "available_kib": mem.get("MemAvailable"),
             "free_kib": mem.get("MemFree"),
@@ -3010,8 +3040,13 @@ def host_monitor():
             "buffers_kib": mem.get("Buffers"),
             "swap_total_kib": mem.get("SwapTotal"),
             "swap_free_kib": mem.get("SwapFree"),
-        },
-        "net": {"rates": net_rates},
+            "committed_kib": mem.get("Committed_AS"),
+            "zswap_kib": mem.get("Zswap"),
+            "arc_size_bytes": (_arc.get("size") if _arc else None),
+            "arc_max_bytes":  (_arc.get("c_max") if _arc else None),
+            "arc_available":  bool(_arc and _arc.get("size") is not None),
+        })(),
+        "net": {"rates": net_rates, "counters": net_counters},
         "gpu": {"available": bool(gpus), "devices": gpus},
         "power": {"available": pwr_avail, "watts": watts},
     }
@@ -3685,69 +3720,112 @@ INDEX_HTML = r'''<!DOCTYPE html>
   .cloff{font-size:12px;color:var(--dim);margin-top:10px;line-height:1.65}
   .cloff b{color:var(--no)}
 
-  /* ===== Storage-хаб (карточки подсистем) ===== */
-  .stohub{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
-    gap:14px;margin-top:14px}
-  .stocard{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:18px 18px 16px;display:flex;flex-direction:column;gap:8px;
-    transition:border-color .15s,transform .15s;cursor:pointer;position:relative}
-  .stocard:hover{border-color:var(--accent);transform:translateY(-1px)}
-  .stocard.off{opacity:.55;cursor:not-allowed}
-  .stocard.off:hover{border-color:var(--line);transform:none}
-  .stocard .stohd{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:600}
-  .stocard .stoico{width:32px;height:32px;border-radius:8px;background:#1c2330;
-    display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--accent)}
-  .stocard .stosub{font-size:12px;color:var(--dim);line-height:1.45}
-  .stocard .stostat{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
-  .stocard .stochip{font-size:11px;padding:3px 8px;border-radius:6px;
-    background:#15242b;color:var(--dim);border:1px solid var(--line)}
-  .stocard .stochip.ok{color:var(--ok);border-color:#1a3a35}
-  .stocard .stochip.warn{color:#f0b441;border-color:#3a2e1a}
-  .stocard .stochip.err{color:var(--bad);border-color:#3a1a1a}
-  .stocard .stogo{margin-top:8px;font-size:12.5px;color:var(--accent);align-self:flex-start}
-  /* ===== Системный монитор (master/detail) ===== */
-  .sysmonwrap{display:grid;grid-template-columns:240px 1fr;gap:16px;margin-top:12px;
+  /* ===== Системный монитор (Win10 Task Manager-style 3-column) ===== */
+  .sysmonwrap{display:grid;grid-template-columns:215px 1fr 215px;gap:14px;margin-top:8px;
     align-items:start}
-  .sysmonlist{display:flex;flex-direction:column;gap:8px}
-  .sysmonitem{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-    padding:9px 11px;cursor:pointer;transition:border-color .15s,background .15s;
-    position:relative;overflow:hidden}
+  .sysmonlist{display:flex;flex-direction:column;gap:6px;max-height:calc(100vh - 200px);
+    overflow-y:auto;overflow-x:hidden;
+    scrollbar-width:none;-ms-overflow-style:none}
+  .sysmonlist::-webkit-scrollbar{width:0;height:0;display:none}
+  .sysmonlist .ldhd{display:flex;justify-content:space-between;align-items:center;
+    color:var(--dim);font-size:12px;text-transform:none;padding:4px 4px 6px;
+    border-bottom:1px solid var(--line);margin-bottom:4px}
+  /* kind-color через CSS custom property — общий цвет рамки плитки и спарклайна */
+  .sysmonitem.k-cpu  { --kc:#28e0c4 }
+  .sysmonitem.k-gpu  { --kc:#ff8a3d }
+  .sysmonitem.k-mem  { --kc:#a47bd0 }
+  .sysmonitem.k-disk { --kc:#5fd07b }
+  .sysmonitem.k-net  { --kc:#b266ff }
+  .sysmonitem.k-pwr  { --kc:#c79bd6 }
+  .sysmonitem{background:var(--panel);
+    border:1.5px solid var(--kc, var(--line));border-radius:8px;
+    padding:6px 8px;cursor:pointer;transition:background .12s,box-shadow .12s;
+    display:flex;gap:8px;align-items:center}
   .sysmonitem:hover{background:#151b24}
-  .sysmonitem.active{border-color:var(--accent);background:#15242b}
+  .sysmonitem.active{background:#15242b;box-shadow:0 0 0 1px var(--accent),
+    inset 0 0 0 1px rgba(40,224,196,.15)}
   .sysmonitem.unav{opacity:.55}
-  .sysmonitem .syshd{display:flex;justify-content:space-between;align-items:baseline;
-    margin-bottom:4px;gap:8px}
-  .sysmonitem .sysnm{font-size:11px;font-weight:700;letter-spacing:1.4px;color:var(--dim)}
-  .sysmonitem.active .sysnm{color:var(--accent)}
-  .sysmonitem .sysval{font-size:14px;font-weight:600;color:var(--txt);
-    font-variant-numeric:tabular-nums}
-  .sysmonitem .sysval .u{font-size:10px;color:var(--dim);margin-left:2px;font-weight:400}
-  .sysspark{display:block;width:100%;height:36px}
-  .sysmondetail{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-    padding:18px 20px;min-height:380px}
-  .sysmondetail h2{margin:0 0 4px;font-size:18px;font-weight:600;color:var(--txt)}
-  .sysmondetail .sub{color:var(--dim);font-size:12px;margin-bottom:14px}
-  .sysmondetail .bigchart{background:#0a0f15;border:1px solid var(--line);border-radius:6px;
-    padding:10px;margin:12px 0}
-  .sysmondetail canvas.bigcv{display:block;width:100%;height:160px}
-  .sysmondetail .chartlbl{display:flex;justify-content:space-between;
-    font-size:11px;color:var(--dim);margin-bottom:4px;letter-spacing:.4px;text-transform:uppercase}
-  .sysmondetail .chartlbl b{color:var(--accent);font-variant-numeric:tabular-nums}
-  .corebars{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px;margin-top:10px}
-  .corebar{background:#0f161f;border:1px solid var(--line);border-radius:6px;padding:6px 9px;
-    font-size:12px;display:flex;justify-content:space-between;align-items:center;
-    font-variant-numeric:tabular-nums}
-  .corebar .cb{display:inline-block;width:80px;height:6px;background:#15242b;
-    border-radius:3px;overflow:hidden;border:1px solid var(--line)}
-  .corebar .cb span{display:block;height:100%;background:var(--accent)}
-  .corebar .cb span.warn{background:#f0b441}
-  .corebar .cb span.err{background:var(--bad)}
-  .statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}
-  .statcell{background:#0f161f;border:1px solid var(--line);border-radius:6px;padding:10px 12px}
-  .statcell .l{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
-  .statcell .v{font-size:18px;font-weight:600;color:var(--txt);margin-top:3px;
-    font-variant-numeric:tabular-nums}
-  .statcell .v .u{font-size:11px;color:var(--dim);margin-left:3px;font-weight:400}
+  .sysmonitem .spr{flex:none;width:88px;height:46px;background:#0a0f15;border-radius:4px;
+    border:1px solid var(--kc, var(--line));position:relative;overflow:hidden}
+  .sysmonitem .spr canvas{display:block;width:100%;height:100%}
+  .sysmonitem .info{flex:1;min-width:0;line-height:1.2}
+  .sysmonitem .info .nm{display:flex;align-items:center;gap:5px;font-size:12.5px;
+    font-weight:600;color:var(--txt);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sysmonitem .info .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+    background:var(--accent);flex:none}
+  .sysmonitem .info .vl{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;
+    margin-top:1px}
+  .sysmonitem .info .sb{font-size:10.5px;color:var(--dim);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+
+  .sysmonchart{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:14px 18px 16px;min-height:520px}
+  /* kind-color на .sysmonchart прокидывается через --kc — рамки .bigpane перекрашиваются */
+  .sysmonchart.k-cpu  { --kc:#28e0c4 }
+  .sysmonchart.k-gpu  { --kc:#ff8a3d }
+  .sysmonchart.k-mem  { --kc:#a47bd0 }
+  .sysmonchart.k-disk { --kc:#5fd07b }
+  .sysmonchart.k-net  { --kc:#b266ff }
+  .sysmonchart.k-pwr  { --kc:#c79bd6 }
+  .sysmonchart .chdr{display:flex;align-items:baseline;justify-content:space-between;
+    gap:14px;margin-bottom:14px}
+  .sysmonchart .ctitle{font-size:24px;font-weight:600;color:var(--txt);margin:0}
+  .sysmonchart .ctitle .sm{font-size:14px;color:var(--dim);font-weight:400;margin-left:8px}
+  .sysmonchart .cmodel{font-size:12px;color:var(--dim);margin-left:auto;padding-right:10px}
+  .sysmonchart .crange{font-size:11.5px;color:var(--dim);background:#0f161f;
+    border:1px solid var(--line);border-radius:4px;padding:3px 8px}
+
+  .bigpane{background:#0a0f15;border:1.5px solid var(--kc, var(--line));border-radius:8px;
+    margin-bottom:12px;padding:10px 12px 8px}
+  .bigpane .bhdr{display:flex;justify-content:space-between;align-items:baseline;
+    font-size:12px;color:var(--dim);margin-bottom:6px}
+  .bigpane .bhdr .bmax{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+  .bigpane .bcvbox{position:relative;width:100%;height:140px;
+    background-color:#0a0f15;
+    background-image:
+      repeating-linear-gradient(0deg,  transparent 0 calc(10% - 1px), #1a2330 calc(10% - 1px) 10%),
+      repeating-linear-gradient(90deg, transparent 0 calc(10% - 1px), #1a2330 calc(10% - 1px) 10%)}
+  .bigpane .bcv{display:block;width:100%;height:100%;position:absolute;inset:0}
+  .bigpane .bfoot{display:flex;justify-content:space-between;font-size:10.5px;color:#5b626d;
+    margin-top:5px;letter-spacing:.3px}
+
+  /* CPU per-core: vertical bar slева + сетка маленьких графов справа */
+  .cpubox{display:grid;grid-template-columns:50px 1fr;gap:10px;margin-bottom:10px}
+  .cpubar{background:#0a0f15;border:1px solid var(--line);border-radius:4px;
+    position:relative;display:flex;flex-direction:column;align-items:center;
+    padding:8px 0;font-size:10.5px;color:var(--dim)}
+  .cpubar .lbl{margin-bottom:6px;letter-spacing:.5px}
+  .cpubar .bar{flex:1;width:18px;background:#0f1923;border-radius:2px;
+    position:relative;overflow:hidden;border:1px solid #1a2330}
+  .cpubar .bar span{position:absolute;left:0;right:0;bottom:0;background:var(--accent)}
+  .cpubar .v{margin-top:6px;font-variant-numeric:tabular-nums;color:var(--accent);font-weight:600}
+  .coregrid{display:grid;gap:8px;background:transparent;padding:0}
+  .corecell{background-color:#0a0f15;border:1.5px solid #28e0c4;border-radius:6px;
+    position:relative;height:60px;overflow:hidden;
+    background-image:
+      repeating-linear-gradient(0deg,  transparent 0 calc(25% - 1px), #1a2330 calc(25% - 1px) 25%),
+      repeating-linear-gradient(90deg, transparent 0 calc(20% - 1px), #1a2330 calc(20% - 1px) 20%)}
+  .corecell canvas{display:block;width:100%;height:100%;position:absolute;inset:0}
+  .coreghdr{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);
+    margin-bottom:4px;padding:0 2px}
+
+  .sysmonspecs{padding:8px 4px 8px 14px;font-size:12.5px}
+  .sysmonspecs .srow{margin-bottom:10px}
+  .sysmonspecs .sl{color:var(--dim);font-size:11.5px;line-height:1.15}
+  .sysmonspecs .sv{color:var(--txt);font-weight:600;font-size:14px;
+    font-variant-numeric:tabular-nums;line-height:1.25;margin-top:1px}
+  .sysmonspecs .sv .u{color:var(--dim);font-size:11px;font-weight:400;margin-left:2px}
+  .sysmonspecs .sgrp{margin:14px 0 8px;color:var(--dim);font-size:11.5px;
+    font-weight:700;letter-spacing:.6px;text-transform:none;
+    padding-top:10px;border-top:1px solid var(--line)}
+  .sysmonspecs .legend{display:flex;gap:10px;font-size:11px;color:var(--dim);margin-top:4px}
+  .sysmonspecs .legend .lk{display:flex;align-items:center;gap:4px}
+  .sysmonspecs .legend .swat{width:10px;height:3px;border-radius:1px;background:var(--accent)}
+  .memstruct{display:flex;height:8px;border-radius:2px;overflow:hidden;
+    border:1px solid var(--line);margin-top:6px}
+  .memstruct .seg{height:100%}
+
   .sysunav{padding:36px 18px;text-align:center;color:var(--dim);font-size:13px}
   .sysunav b{color:var(--txt);display:block;margin-bottom:8px;font-size:15px}
   /* ===== страницы Узла ===== */
@@ -3831,16 +3909,12 @@ INDEX_HTML = r'''<!DOCTYPE html>
     </div>
     <nav class="nav" data-cat="host">
       <div class="navgrp">Узел</div>
-      <div class="navitem" data-view="host" data-subview="sysinfo"><span class="ico">&#9432;</span>Системная информация</div>
       <div class="navitem" data-view="host" data-subview="monitor"><span class="ico">&#9889;</span>Системный монитор</div>
+      <div class="navitem" data-view="host" data-subview="sysinfo"><span class="ico">&#9432;</span>Системная информация</div>
       <div class="navitem" data-view="host" data-subview="vmct"><span class="ico">&#10070;</span>VM / CT</div>
-      <div class="navitem" data-view="host" data-subview="services"><span class="ico">&#9881;</span>Системные службы</div>
-      <div class="navitem" data-view="host" data-subview="journal"><span class="ico">&#9783;</span>Журналы</div>
       <div class="navitem" data-view="host" data-subview="cluster"><span class="ico">&#11041;</span>Кластер PVE</div>
     </nav>
     <nav class="nav cat-active" data-cat="storage">
-      <div class="navgrp">Обзор</div>
-      <div class="navitem" data-view="storage"><span class="ico">&#9636;</span>Все хранилища</div>
       <div class="navgrp">Узел</div>
       <div class="navitem" data-view="mon"><span class="ico">&#9201;</span>Мониторинг</div>
       <div class="navitem" data-view="parts"><span class="ico">&#9707;</span>Разметка</div>
@@ -3854,9 +3928,6 @@ INDEX_HTML = r'''<!DOCTYPE html>
       <div class="navitem" data-view="network" data-subview="overview"><span class="ico">&#9678;</span>Обзор</div>
       <div class="navitem" data-view="network" data-subview="bridges"><span class="ico">&#9776;</span>Bridges</div>
       <div class="navitem" data-view="network" data-subview="vlan"><span class="ico">&#9783;</span>VLAN</div>
-      <div class="navitem" data-view="network" data-subview="bond"><span class="ico">&#9775;</span>Bond</div>
-      <div class="navitem" data-view="network" data-subview="routes"><span class="ico">&#10148;</span>Маршруты</div>
-      <div class="navitem" data-view="network" data-subview="firewall"><span class="ico">&#9968;</span>Firewall</div>
     </nav>
     <div class="navbot">
       <div class="navitem" data-view="settings"><span class="ico">&#9881;</span>Настройки</div>
@@ -3920,16 +3991,28 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <section class="view" id="view-zfs">
       <h1 class="vt">ZFS</h1>
       <div class="vsub">локальные пулы и наборы данных ZFS</div>
-      <div class="lblrow" style="margin:8px 0 2px">
-        <button class="wizbtn" id="zw-open">&#9874; Мастер пулов ZFS</button>
-        <button class="wizbtn" id="cc-open" style="margin-left:8px">&#9881; Управление кэшем</button></div>
-      <div id="zfs"></div>
-    </section>
-
-    <section class="view" id="view-storage">
-      <h1 class="vt">Storage <span class="engbadge">все подсистемы хранения</span></h1>
-      <div class="vsub">сводка по Vitastor &middot; Ceph &middot; ZFS &middot; VitastorFS &middot; нажмите карточку для детальной страницы</div>
-      <div class="stohub" id="stohub"></div>
+      <div class="vtabs">
+        <div class="vtab active" data-vtab="pools">&#9633; Пулы</div>
+        <div class="vtab" data-vtab="settings">&#9881; Настройки</div>
+      </div>
+      <div class="vtabpane active" id="zftab-pools">
+        <div class="lblrow" style="margin:8px 0 2px">
+          <button class="wizbtn" id="zw-open">&#9874; Мастер пулов ZFS</button>
+          <button class="wizbtn" id="cc-open" style="margin-left:8px">&#9881; Управление кэшем</button></div>
+        <div id="zfs"></div>
+      </div>
+      <div class="vtabpane" id="zftab-settings">
+        <div class="netplan">
+          <div class="lbl">Настройки модуля ZFS</div>
+          <ul class="planlist">
+            <li><b>ARC-кэш</b> &mdash; пока через кнопку «Управление кэшем» на вкладке «Пулы»</li>
+            <li><b>L2ARC / SLOG</b> &mdash; добавление кеш/лог устройств (в плане)</li>
+            <li><b>Сжатие/дедупликация</b> &mdash; глобальные параметры (в плане)</li>
+            <li><b>zfs.conf / module params</b> &mdash; редактирование <code>/etc/modprobe.d/zfs.conf</code> (в плане)</li>
+            <li><b>Автоснимки</b> &mdash; интеграция с <code>zfs-auto-snapshot</code> / <code>zrepl</code> (в плане)</li>
+          </ul>
+        </div>
+      </div>
     </section>
 
     <section class="view" id="view-host">
@@ -3944,12 +4027,6 @@ INDEX_HTML = r'''<!DOCTYPE html>
       </div>
       <div class="host-sect" data-sub="vmct" style="display:none">
         <div id="host-vmct" class="hostpane">загрузка&hellip;</div>
-      </div>
-      <div class="host-sect" data-sub="services" style="display:none">
-        <div id="host-services" class="hostpane">загрузка&hellip;</div>
-      </div>
-      <div class="host-sect" data-sub="journal" style="display:none">
-        <div id="host-journal" class="hostpane">загрузка&hellip;</div>
       </div>
       <div class="host-sect" data-sub="cluster" style="display:none">
         <div id="host-cluster" class="hostpane">загрузка&hellip;</div>
@@ -3990,38 +4067,6 @@ INDEX_HTML = r'''<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="net-sect" data-sub="bond" style="display:none">
-        <div class="netplan">
-          <div class="lbl">Bond &mdash; в разработке</div>
-          <ul class="planlist">
-            <li>Режимы: <code>active-backup</code>, <code>balance-rr</code>, <code>802.3ad</code> (LACP), <code>balance-xor</code></li>
-            <li>Lacp-rate, miimon, hash-policy</li>
-            <li>Объединение интерфейсов <code>eno1+eno2</code> и подобных</li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="net-sect" data-sub="routes" style="display:none">
-        <div class="netplan">
-          <div class="lbl">Маршруты &mdash; в разработке</div>
-          <ul class="planlist">
-            <li>Таблица маршрутов (<code>ip route</code>), шлюз по умолчанию</li>
-            <li>Статические маршруты в <code>/etc/network/interfaces</code></li>
-            <li>DNS-серверы (<code>resolv.conf</code>), search-домен</li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="net-sect" data-sub="firewall" style="display:none">
-        <div class="netplan">
-          <div class="lbl">Firewall &mdash; в разработке</div>
-          <ul class="planlist">
-            <li>Обзор правил уровня хоста (<code>/etc/pve/firewall/cluster.fw</code>)</li>
-            <li>Включён ли host firewall</li>
-            <li>Список security groups</li>
-          </ul>
-        </div>
-      </div>
     </section>
 
     <section class="view" id="view-settings">
@@ -4029,8 +4074,6 @@ INDEX_HTML = r'''<!DOCTYPE html>
       <div class="vsub">параметры дашборда PROXOMATRON</div>
       <div id="settings"></div>
     </section>
-
-    <footer>PROXOMATRON prototype &middot; control plane &middot; данные: vitastor-cli / etcd / lsblk / /proc/diskstats / zfs / ceph</footer>
   </main>
 </div>
 
@@ -4101,7 +4144,7 @@ function plural(n,one,few,many){
 
 var viewCategory={
   host:"host",
-  storage:"storage", mon:"storage", parts:"storage",
+  mon:"storage", parts:"storage",
   vitastor:"storage", ceph:"storage", zfs:"storage",
   network:"network"
 };
@@ -4128,8 +4171,7 @@ function setView(name, subview){
   });
   var cat=viewCategory[name]; if(cat) setCategory(cat);
   if(name==="settings") renderSettings();
-  if(name==="storage") renderStorageHub();
-  if(name==="host") renderHost(subview||"sysinfo");
+  if(name==="host") renderHost(subview||"monitor");
   if(name==="network") renderNetwork(subview||"overview");
   if(name==="vitastor" && el("vtab-cluster") && el("vtab-cluster").classList.contains("active")){
     if(clTabTimer) clearTimeout(clTabTimer);
@@ -4137,7 +4179,7 @@ function setView(name, subview){
   }
   try{ localStorage.setItem("vb_view", name);
        if(name==="network") localStorage.setItem("vb_netsub", subview||"overview");
-       if(name==="host") localStorage.setItem("vb_hostsub", subview||"sysinfo"); }catch(e){}
+       if(name==="host") localStorage.setItem("vb_hostsub", subview||"monitor"); }catch(e){}
 }
 document.querySelectorAll(".navitem").forEach(function(it){
   it.addEventListener("click", function(){
@@ -4147,8 +4189,8 @@ document.querySelectorAll(".navitem").forEach(function(it){
 document.querySelectorAll(".sidetab").forEach(function(t){
   t.addEventListener("click", function(){
     var cat=t.getAttribute("data-cat");
-    var defaults={host:"host", storage:"storage", network:"network"};
-    var defaultSub={host:"sysinfo", network:"overview"};
+    var defaults={host:"host", storage:"mon", network:"network"};
+    var defaultSub={host:"monitor", network:"overview"};
     setView(defaults[cat]||"storage", defaultSub[cat]||null);
   });
 });
@@ -4170,6 +4212,19 @@ function setVTab(name){
 document.querySelectorAll("#view-vitastor .vtab").forEach(function(t){
   t.addEventListener("click", function(){ setVTab(t.getAttribute("data-vtab")); });
 });
+/* вкладки внутри страницы ZFS */
+function setZfsTab(name){
+  document.querySelectorAll("#view-zfs .vtab").forEach(function(t){
+    t.classList.toggle("active", t.getAttribute("data-vtab")===name);
+  });
+  document.querySelectorAll("#view-zfs .vtabpane").forEach(function(p){
+    p.classList.toggle("active", p.id==="zftab-"+name);
+  });
+  try{ localStorage.setItem("vb_zftab", name); }catch(e){}
+}
+document.querySelectorAll("#view-zfs .vtab").forEach(function(t){
+  t.addEventListener("click", function(){ setZfsTab(t.getAttribute("data-vtab")); });
+});
 function applyVisibility(){
   var vis={vitastor:cfg.showVita,ceph:cfg.showCeph,zfs:cfg.showZfs};
   document.querySelectorAll(".navitem").forEach(function(it){
@@ -4184,13 +4239,15 @@ function applyVisibility(){
 }
 
 /* графики */
-function drawArea(cv, data, color, ymax){
+function drawArea(cv, data, color, ymax, noGrid){
   var w=cv.clientWidth||600, h=cv.clientHeight||140;
   cv.width=w; cv.height=h;
   var ctx=cv.getContext("2d");
   ctx.clearRect(0,0,w,h);
-  ctx.strokeStyle="#222a35"; ctx.lineWidth=1;
-  for(var g=1;g<4;g++){ var gy=h*g/4; ctx.beginPath(); ctx.moveTo(0,gy+.5); ctx.lineTo(w,gy+.5); ctx.stroke(); }
+  if(!noGrid){
+    ctx.strokeStyle="#222a35"; ctx.lineWidth=1;
+    for(var g=1;g<4;g++){ var gy=h*g/4; ctx.beginPath(); ctx.moveTo(0,gy+.5); ctx.lineTo(w,gy+.5); ctx.stroke(); }
+  }
   if(!data||!data.length||ymax<=0) return;
   var N=60;
   function X(i){ return (i/(N-1))*w; }
@@ -6562,65 +6619,18 @@ function tickOverview(){
     if(errs.length&&vinst){ b.style.display="block"; b.textContent="vitastor-cli: "+errs.join("; "); }
     else b.style.display="none";
     renderVitastor(d.vitastor); renderZfs(d.zfs); renderCeph(d.ceph);
-    renderStorageHub();
     if(el("view-settings").classList.contains("active")) renderSettings();
   }).catch(function(e){
     var b=el("banner"); b.style.display="block"; b.textContent="Нет связи с API: "+e;
   });
 }
-function renderStorageHub(){
-  var hub=el("stohub"); if(!hub) return;
-  var d=lastOverview||{}, vt=d.vitastor||{}, cp=d.ceph||{}, zf=d.zfs||{};
-  var vinst=(vt.installed!==false)&&!(vt.cp&&vt.cp.conf===false);
-  var vEng=vt.engine_version||"&mdash;";
-  var vPools=(vt.pools&&vt.pools.length)||0;
-  var vOsds=(vt.osds&&vt.osds.length)||0;
-  var cphH=(cp&&cp.health)||"";
-  var zPools=(zf&&zf.pools&&zf.pools.length)||0;
-  var vfsCnt=0;
-  if(vt.pools){ vt.pools.forEach(function(p){ if(p&&p.mount&&p.mount.unit) vfsCnt++; }); }
-  function chip(t,cls){ return "<span class=\"stochip"+(cls?" "+cls:"")+"\">"+t+"</span>"; }
-  function card(id,name,ico,desc,enabled,chips){
-    var cls=enabled?"stocard":"stocard off";
-    var go=enabled?"<div class=\"stogo\">Открыть страницу &rarr;</div>"
-                  :"<div class=\"stogo\" style=\"color:var(--dim)\">скрыто &mdash; включить в настройках</div>";
-    return "<div class=\""+cls+"\" data-goto=\""+id+"\">"+
-      "<div class=\"stohd\"><span class=\"stoico\">"+ico+"</span>"+name+"</div>"+
-      "<div class=\"stosub\">"+desc+"</div>"+
-      "<div class=\"stostat\">"+chips+"</div>"+go+"</div>";
-  }
-  var vChips = vinst
-    ? chip("движок "+vEng,"ok")+chip(vPools+" пул"+plRu(vPools))+chip(vOsds+" OSD")
-    : chip("не установлен","warn");
-  var cChips = cphH
-    ? chip(cphH, cphH.indexOf("OK")>=0?"ok":(cphH.indexOf("ERR")>=0?"err":"warn"))
-    : chip("&mdash;");
-  var zChips = (zf&&zf.installed!==false)
-    ? chip(zPools+" пул"+plRu(zPools), zPools>0?"ok":"")
-    : chip("не установлен","warn");
-  var vfsChips = vinst
-    ? chip(vfsCnt+" монтирован"+(vfsCnt===1?"":"о"),(vfsCnt>0?"ok":""))
-    : chip("требует Vitastor","warn");
-  var html=""+
-    card("vitastor","Vitastor","&#9670;","распределённое блочное хранилище",cfg.showVita,vChips)+
-    card("ceph","Ceph","&#9673;","распределённое хранилище объектов и блоков",cfg.showCeph,cChips)+
-    card("zfs","ZFS","&#9633;","локальные пулы и наборы данных",cfg.showZfs,zChips)+
-    card("vitastor","VitastorFS","&#9678;","распределённая ФС поверх пулов Vitastor",cfg.showVita,vfsChips);
-  hub.innerHTML=html;
-  document.querySelectorAll("#stohub .stocard:not(.off)").forEach(function(c){
-    c.onclick=function(){ setView(c.getAttribute("data-goto")); };
-  });
-}
-function plRu(n){ var n10=n%10, n100=n%100;
-  if(n10===1&&n100!==11) return ""; if(n10>=2&&n10<=4&&(n100<10||n100>=20)) return "а"; return "ов"; }
 /* ===== страницы Узла ===== */
 function renderHost(subview){
-  var sub = subview || "sysinfo";
+  var sub = subview || "monitor";
   if(sub==="resources") sub="monitor"; // миграция: старое имя
   var titles = {
     sysinfo:"Системная информация", monitor:"Системный монитор",
-    vmct:"VM / CT", services:"Системные службы",
-    journal:"Журналы", cluster:"Кластер PVE"
+    vmct:"VM / CT", cluster:"Кластер PVE"
   };
   var t = el("hostTitle"); if(t) t.innerHTML = "Узел &mdash; " + (titles[sub]||"обзор");
   document.querySelectorAll("#view-host .host-sect").forEach(function(s){
@@ -6632,8 +6642,7 @@ function renderHost(subview){
   }
   var renderers = {
     sysinfo:renderHostSysinfo, monitor:renderHostMonitor,
-    vmct:renderHostVmct, services:renderHostServices,
-    journal:renderHostJournal, cluster:renderHostCluster
+    vmct:renderHostVmct, cluster:renderHostCluster
   };
   var fn = renderers[sub]; if(fn) fn();
 }
@@ -6675,12 +6684,21 @@ function _bar(pct){
   var cls = pct>=90?" err":(pct>=75?" warn":"");
   return '<div class="progress"><span class="'+cls.trim()+'" style="width:'+pct+'%"></span></div>'+pct+'%';
 }
-/* ===== Системный монитор (master/detail с историей 60s) ===== */
+/* ===== Системный монитор (Win10 Task Manager-style 3-column) ===== */
 var _sysmon = {
-  series: {cpu:[], ram:[], net:[], stor:[], gpu:[], pwr:[]},
-  selected: "cpu", data: null, timer: null
+  selected: "cpu",
+  timer: null,
+  data: null,           // последний /api/host/monitor
+  dm: null,             // последний /api/diskmon
+  hist: {               // история значений (макс 60 точек)
+    cpu: [], cores: [], gpu: [],
+    mem_used: [], mem_swap: [], mem_arc: [],
+    pwr: [],
+    disks: {},          // {sda: {util:[], rw:[]}}
+    nets:  {},          // {ens18: {tot:[], rx:[], tx:[]}}
+  }
 };
-function _push60(arr, v){ arr.push(v==null?0:+v); while(arr.length>60) arr.shift(); }
+function _h60(arr, v){ arr.push(v==null?0:+v); while(arr.length>60) arr.shift(); return arr; }
 function fmtBpsShort(b){
   if(b==null||!isFinite(b)) return "0 B/s";
   var n=+b;
@@ -6689,258 +6707,560 @@ function fmtBpsShort(b){
   if(n>=1e3) return (n/1e3).toFixed(1)+" KB/s";
   return Math.round(n)+" B/s";
 }
-function _pushSysmonSeries(d){
-  var s=_sysmon.series;
-  _push60(s.cpu, d.cpu && d.cpu.pct);
-  if(d.ram && d.ram.total_kib){
-    var used = d.ram.total_kib - (d.ram.available_kib||0);
-    _push60(s.ram, Math.round(used/d.ram.total_kib*100));
-  } else _push60(s.ram, 0);
-  var rx=0, tx=0;
-  if(d.net && d.net.rates) d.net.rates.forEach(function(r){ rx+=r.rx_bps; tx+=r.tx_bps; });
-  _push60(s.net, rx+tx);
-  var stPct=0;
-  if(typeof lastDM!=="undefined" && lastDM && lastDM.disks){
-    lastDM.disks.forEach(function(dk){ if(dk.active_pct>stPct) stPct=dk.active_pct; });
+function fmtBitsShort(b){
+  if(b==null||!isFinite(b)) return "0 bps";
+  var n=+b*8;
+  if(n>=1e9) return (n/1e9).toFixed(2)+" Gbps";
+  if(n>=1e6) return (n/1e6).toFixed(1)+" Mbps";
+  if(n>=1e3) return (n/1e3).toFixed(1)+" Kbps";
+  return Math.round(n)+" bps";
+}
+function fmtBytesB(b){
+  if(b==null||!isFinite(b)) return "0 B";
+  var n=+b;
+  if(n>=1099511627776) return (n/1099511627776).toFixed(2)+" TiB";
+  if(n>=1073741824)    return (n/1073741824).toFixed(2)+" GiB";
+  if(n>=1048576)       return (n/1048576).toFixed(1)+" MiB";
+  if(n>=1024)          return (n/1024).toFixed(1)+" KiB";
+  return Math.round(n)+" B";
+}
+function fmtSecsHMS(s){
+  if(s==null) return "—";
+  s=Math.floor(+s);
+  var d=Math.floor(s/86400), h=Math.floor(s%86400/3600),
+      m=Math.floor(s%3600/60), ss=s%60;
+  function p(n){return n<10?'0'+n:n;}
+  return p(d)+':'+p(h)+':'+p(m)+':'+p(ss);
+}
+function fmtFreqGHz(mhz){
+  if(mhz==null) return "—";
+  if(mhz>=1000) return (mhz/1000).toFixed(2)+" ГГц";
+  return mhz+" МГц";
+}
+function _pushSysmonHist(h, dm){
+  var hh=_sysmon.hist;
+  // CPU
+  _h60(hh.cpu, h.cpu && h.cpu.pct);
+  // per-core
+  if(h.cpu && h.cpu.per_core_pct){
+    while(hh.cores.length < h.cpu.per_core_pct.length) hh.cores.push([]);
+    h.cpu.per_core_pct.forEach(function(p,i){ _h60(hh.cores[i], p); });
   }
-  _push60(s.stor, stPct);
+  // RAM used (KiB) — для отрисовки графика
+  if(h.ram && h.ram.total_kib){
+    var used = h.ram.total_kib - (h.ram.available_kib||0);
+    _h60(hh.mem_used, used);
+    var swUsed = (h.ram.swap_total_kib && h.ram.swap_free_kib!=null)
+                  ? (h.ram.swap_total_kib - h.ram.swap_free_kib) : 0;
+    _h60(hh.mem_swap, swUsed);
+    _h60(hh.mem_arc, h.ram.arc_size_bytes || 0);
+  }
+  // GPU avg util
   var gU=0, gN=0;
-  if(d.gpu && d.gpu.devices) d.gpu.devices.forEach(function(g){ gU+=g.util_pct; gN++; });
-  _push60(s.gpu, gN?Math.round(gU/gN):0);
-  _push60(s.pwr, d.power && d.power.watts);
+  if(h.gpu && h.gpu.devices) h.gpu.devices.forEach(function(g){ gU+=g.util_pct; gN++; });
+  _h60(hh.gpu, gN?Math.round(gU/gN):0);
+  _h60(hh.pwr, h.power && h.power.watts);
+  // Per-net
+  if(h.net && h.net.rates){
+    h.net.rates.forEach(function(r){
+      var k = r.name;
+      if(!hh.nets[k]) hh.nets[k] = {tot:[], rx:[], tx:[]};
+      _h60(hh.nets[k].rx, r.rx_bps);
+      _h60(hh.nets[k].tx, r.tx_bps);
+      _h60(hh.nets[k].tot, r.rx_bps + r.tx_bps);
+    });
+  }
+  // Per-disk (из /api/diskmon series)
+  if(dm && dm.series){
+    Object.keys(dm.series).forEach(function(name){
+      var s = dm.series[name] || [];
+      var last = s.length ? s[s.length-1] : null;
+      if(!hh.disks[name]) hh.disks[name] = {util:[], rw:[]};
+      _h60(hh.disks[name].util, last ? last.util : 0);
+      _h60(hh.disks[name].rw,   last ? ((last.rbps||0)+(last.wbps||0)) : 0);
+    });
+  }
 }
 function renderHostMonitor(){
   var pane = el("host-monitor"); if(!pane) return;
   pane.innerHTML =
     '<div class="sysmonwrap">'+
-      '<div class="sysmonlist" id="sysmonList"></div>'+
-      '<div class="sysmondetail" id="sysmonDetail">'+
-        '<div class="sub">загрузка&hellip;</div></div>'+
+      '<div class="sysmonlist" id="sysmonList">'+
+        '<div class="ldhd"><span>Устройства</span></div>'+
+      '</div>'+
+      '<div class="sysmonchart" id="sysmonChart">'+
+        '<div class="chdr"><h2 class="ctitle">Загрузка&hellip;</h2></div></div>'+
+      '<div class="sysmonspecs" id="sysmonSpecs"></div>'+
     '</div>';
   if(_sysmon.timer) clearInterval(_sysmon.timer);
   _tickSysmon(); _sysmon.timer = setInterval(_tickSysmon, 2000);
 }
 function _tickSysmon(){
-  if(!el("host-monitor") || !document.querySelector("#view-host .host-sect[data-sub=\"monitor\"]") ||
-     document.querySelector("#view-host .host-sect[data-sub=\"monitor\"]").style.display==="none"){
+  var sect = document.querySelector("#view-host .host-sect[data-sub=\"monitor\"]");
+  if(!el("host-monitor") || !sect || sect.style.display==="none"){
     if(_sysmon.timer){ clearInterval(_sysmon.timer); _sysmon.timer=null; }
     return;
   }
-  fetch("/api/host/monitor", {cache:"no-store"}).then(function(r){return r.json();})
-    .then(function(d){
-      _sysmon.data = d;
-      _pushSysmonSeries(d);
-      _renderSysmonList();
-      _renderSysmonDetail();
-    }).catch(function(e){
-      var ds=el("sysmonDetail"); if(ds) ds.innerHTML='<div class="err">ошибка: '+esc(String(e))+'</div>';
-    });
+  Promise.all([
+    fetch("/api/host/monitor",{cache:"no-store"}).then(function(r){return r.json();}),
+    fetch("/api/diskmon",{cache:"no-store"}).then(function(r){return r.json();}).catch(function(){return null;})
+  ]).then(function(arr){
+    _sysmon.data = arr[0]; _sysmon.dm = arr[1];
+    _pushSysmonHist(_sysmon.data, _sysmon.dm);
+    _renderSysmonList();
+    _renderSysmonDetail();
+  }).catch(function(e){
+    var ch=el("sysmonChart"); if(ch) ch.innerHTML='<div class="err">ошибка: '+esc(String(e))+'</div>';
+  });
+}
+function _buildDevices(){
+  // Динамический список устройств: CPU, GPU, MEM, per-disk, per-net, PWR
+  var h = _sysmon.data || {}, dm = _sysmon.dm || {};
+  var list = [];
+
+  // CPU
+  var cpu = h.cpu || {};
+  list.push({key:"cpu", kind:"cpu", color:"#28e0c4",
+    nm:"ЦП",
+    val: (cpu.pct!=null ? Math.round(cpu.pct)+"%" : "—"),
+    sb: (cpu.freq_mhz && cpu.freq_mhz.length
+          ? fmtFreqGHz(Math.round(cpu.freq_mhz.reduce(function(a,b){return a+b;},0)/cpu.freq_mhz.length))
+          : (cpu.base_freq_mhz ? fmtFreqGHz(cpu.base_freq_mhz) : "")),
+    series: _sysmon.hist.cpu, ymax:100});
+
+  // GPU
+  var gAvail = !!(h.gpu && h.gpu.available);
+  var gU = null;
+  if(gAvail && h.gpu.devices && h.gpu.devices.length){
+    var u=0; h.gpu.devices.forEach(function(g){u+=g.util_pct;});
+    gU = Math.round(u / h.gpu.devices.length);
+  }
+  list.push({key:"gpu", kind:"gpu", color:"#ff8a3d",
+    nm:"ГП", val: (gU!=null ? gU+"%" : "0%"),
+    sb: gAvail ? (h.gpu.devices[0].name||"") : "",
+    series: _sysmon.hist.gpu, ymax:100, unav:!gAvail});
+
+  // Memory
+  var ram = h.ram || {};
+  var memPct = null, memUsed = null;
+  if(ram.total_kib){
+    memUsed = ram.total_kib - (ram.available_kib||0);
+    memPct = Math.round(memUsed / ram.total_kib * 100);
+  }
+  list.push({key:"mem", kind:"mem", color:"#a47bd0",
+    nm:"Память",
+    val: (memPct!=null ? memPct+"%" : "—"),
+    sb: (ram.total_kib ? (fmtBytesB((memUsed||0)*1024)+" / "+fmtBytesB(ram.total_kib*1024)) : ""),
+    series: _sysmon.hist.mem_used,
+    ymax: ram.total_kib || null});
+
+  // Per-disk tiles
+  var disks = (dm && dm.disks) || [];
+  disks.forEach(function(d, idx){
+    var name = d.name;
+    var hist = _sysmon.hist.disks[name] || {util:[], rw:[]};
+    var util = hist.util.length ? hist.util[hist.util.length-1] : 0;
+    var typ = (d.rota==="1") ? "HDD" : "SSD";
+    var bus = (d.tran || "").toUpperCase() || "—";
+    list.push({key:"disk:"+name, kind:"disk", color:"#5fd07b",
+      nm:"Диск ("+idx+")",
+      val: Math.round(util)+"%",
+      sb: typ + " · " + bus,
+      series: hist.util, ymax:100,
+      disk_name: name, disk_info: d});
+  });
+
+  // Per-net tiles — только физические/bond/bridge (без tap/veth/fwbr/lo)
+  var rates = (h.net && h.net.rates) || [];
+  rates.forEach(function(r){
+    var n = r.name;
+    if(/^(lo|tap|veth|fwbr|fwln|fwpr)/.test(n)) return;
+    var hist = _sysmon.hist.nets[n] || {tot:[], rx:[], tx:[]};
+    list.push({key:"net:"+n, kind:"net", color:"#b266ff",
+      nm: n,
+      val: fmtBpsShort(r.rx_bps + r.tx_bps),
+      sb: "S: "+fmtBitsShort(r.tx_bps)+"   R: "+fmtBitsShort(r.rx_bps),
+      series: hist.tot, ymax:null,
+      net_name: n, net_rate: r});
+  });
+
+  // Power (если доступен)
+  if(h.power && h.power.available){
+    list.push({key:"pwr", kind:"pwr", color:"#c79bd6",
+      nm:"Питание",
+      val: (h.power.watts!=null ? h.power.watts+" W" : "—"),
+      sb: "Intel RAPL",
+      series: _sysmon.hist.pwr, ymax:null});
+  }
+  return list;
 }
 function _renderSysmonList(){
-  var d = _sysmon.data || {};
-  var ram = d.ram || {};
-  var ramPct = (ram.total_kib && ram.available_kib!=null)
-    ? Math.round((ram.total_kib-ram.available_kib)/ram.total_kib*100) : null;
-  var netSum=0; if(d.net&&d.net.rates) d.net.rates.forEach(function(r){netSum+=r.rx_bps+r.tx_bps;});
-  var stPct=0;
-  if(typeof lastDM!=="undefined" && lastDM && lastDM.disks){
-    lastDM.disks.forEach(function(dk){ if(dk.active_pct>stPct) stPct=dk.active_pct; });
+  var devs = _buildDevices();
+  // Если выбранный девайс пропал — переключаемся на CPU
+  if(!devs.some(function(d){return d.key === _sysmon.selected;})){
+    _sysmon.selected = "cpu";
   }
-  var gUtil=null;
-  if(d.gpu && d.gpu.devices && d.gpu.devices.length){
-    var u=0; d.gpu.devices.forEach(function(g){u+=g.util_pct;});
-    gUtil = Math.round(u/d.gpu.devices.length);
-  }
-  function v(val,u){ return val==null?'<span class="dim">&mdash;</span>'
-    : val+'<span class="u">'+(u||"")+'</span>'; }
-  var items = [
-    {id:"cpu",  nm:"CPU",  val:v(d.cpu&&d.cpu.pct!=null?d.cpu.pct:null,"%"), col:"#28e0c4", ymax:100, unav:false},
-    {id:"gpu",  nm:"GPU",  val:v(gUtil,"%"), col:"#7be07b", ymax:100, unav:!(d.gpu&&d.gpu.available)},
-    {id:"ram",  nm:"RAM",  val:v(ramPct,"%"), col:"#e87da0", ymax:100, unav:false},
-    {id:"stor", nm:"STOR", val:v(stPct,"%"), col:"#7badff", ymax:100, unav:false},
-    {id:"net",  nm:"NET",  val:'<span style="font-size:12px">'+fmtBpsShort(netSum)+'</span>', col:"#ffa657", ymax:null, unav:false},
-    {id:"pwr",  nm:"PWR",  val:v(d.power&&d.power.watts!=null?d.power.watts:null,"W"), col:"#c79bd6", ymax:null, unav:!(d.power&&d.power.available)}
-  ];
-  var h="";
-  items.forEach(function(it){
-    var cls="sysmonitem"+(it.id===_sysmon.selected?" active":"")+(it.unav?" unav":"");
-    h+='<div class="'+cls+'" data-mon="'+it.id+'">'+
-       '<div class="syshd"><span class="sysnm">'+it.nm+'</span><span class="sysval">'+it.val+'</span></div>'+
-       '<canvas class="sysspark" id="spk-'+it.id+'"></canvas></div>';
+  var listEl = el("sysmonList");
+  var h = '<div class="ldhd"><span>Устройства</span></div>';
+  devs.forEach(function(d){
+    var cls = "sysmonitem k-" + d.kind +
+              (d.key === _sysmon.selected ? " active" : "") +
+              (d.unav ? " unav" : "");
+    h += '<div class="'+cls+'" data-key="'+esc(d.key)+'">'+
+      '<div class="spr"><canvas id="spk-'+esc(d.key).replace(/:/g,"-")+'"></canvas></div>'+
+      '<div class="info">'+
+        '<div class="nm"><span class="dot" style="background:'+d.color+'"></span>'+esc(d.nm)+'</div>'+
+        '<div class="vl">'+d.val+'</div>'+
+        '<div class="sb">'+esc(d.sb||"")+'</div>'+
+      '</div></div>';
   });
-  el("sysmonList").innerHTML = h;
-  items.forEach(function(it){
-    var cv = el("spk-"+it.id); if(!cv) return;
-    drawArea(cv, _sysmon.series[it.id], it.col, it.ymax);
+  listEl.innerHTML = h;
+  devs.forEach(function(d){
+    var cv = el("spk-"+d.key.replace(/:/g,"-"));
+    if(cv) drawArea(cv, d.series, d.color, d.ymax, true);
   });
   document.querySelectorAll(".sysmonitem").forEach(function(node){
     node.onclick = function(){
-      _sysmon.selected = node.getAttribute("data-mon");
+      _sysmon.selected = node.getAttribute("data-key");
       _renderSysmonList(); _renderSysmonDetail();
     };
   });
 }
+function _bigPaneHTML(id, title, max, color){
+  return '<div class="bigpane">'+
+    '<div class="bhdr"><span>'+title+'</span><span class="bmax">'+max+'</span></div>'+
+    '<div class="bcvbox"><canvas class="bcv" id="'+id+'"></canvas></div>'+
+    '<div class="bfoot"><span>60 секунд назад</span><span>0</span></div>'+
+  '</div>';
+}
+function _drawBcv(id, series, color, ymax){
+  var c = el(id); if(!c) return;
+  drawArea(c, series, color, ymax, true);
+}
+function _specRow(label, value){
+  return '<div class="srow"><div class="sl">'+label+'</div><div class="sv">'+value+'</div></div>';
+}
 function _renderSysmonDetail(){
-  var d = _sysmon.data; if(!d){ el("sysmonDetail").innerHTML='<div class="sub">загрузка&hellip;</div>'; return; }
-  var sel = _sysmon.selected;
-  if(sel==="cpu")  return _renderSysmonCPU(d);
-  if(sel==="gpu")  return _renderSysmonGPU(d);
-  if(sel==="ram")  return _renderSysmonRAM(d);
-  if(sel==="stor") return _renderSysmonStor(d);
-  if(sel==="net")  return _renderSysmonNet(d);
-  if(sel==="pwr")  return _renderSysmonPwr(d);
+  var devs = _buildDevices();
+  var dev = null;
+  for(var i=0;i<devs.length;i++) if(devs[i].key === _sysmon.selected){ dev=devs[i]; break; }
+  if(!dev){ return; }
+  el("sysmonChart").className = "sysmonchart k-" + dev.kind;
+  if(dev.kind==="cpu")  return _renderSmCPU(dev);
+  if(dev.kind==="gpu")  return _renderSmGPU(dev);
+  if(dev.kind==="mem")  return _renderSmMem(dev);
+  if(dev.kind==="disk") return _renderSmDisk(dev);
+  if(dev.kind==="net")  return _renderSmNet(dev);
+  if(dev.kind==="pwr")  return _renderSmPwr(dev);
 }
-function _bigChart(title, currentLabel, series, color, ymax, unit){
-  var last = series.length ? series[series.length-1] : 0;
-  var labelVal = (unit==="%") ? (Math.round(last)+"%") :
-                 (unit==="B/s" ? fmtBpsShort(last) : last+(unit||""));
-  return '<div class="chartlbl"><span>'+esc(title)+' &mdash; 60&nbsp;с</span><b>'+labelVal+'</b></div>'+
-         '<div class="bigchart"><canvas class="bigcv" id="bigcv"></canvas></div>'+
-         '<script>(function(){var c=document.getElementById("bigcv");if(c){'+
-         'window._drawBig=function(){drawArea(c,'+JSON.stringify(series)+',"'+color+'",'+
-         (ymax==null?"null":ymax)+');};_drawBig();}})();<\/script>';
-}
-function _renderSysmonCPU(d){
-  var c = d.cpu || {};
-  var pct = c.pct==null ? "&mdash;" : c.pct+"%";
-  var load = (c.loadavg||[]).map(function(x){return x.toFixed(2);}).join(" / ");
+function _renderSmCPU(dev){
+  var d = _sysmon.data || {}; var c = d.cpu || {};
+  var pct = c.pct==null ? 0 : c.pct;
+  var nCores = (c.per_core_pct||[]).length || c.cores || 1;
+  // grid columns: 1 если ≤4 ядер, 2 если ≤16, 4 иначе
+  var cols = nCores <= 4 ? 1 : (nCores <= 16 ? 2 : 4);
+  var rows = Math.ceil(nCores / cols);
+  var coreCells = "";
+  for(var i=0;i<nCores;i++){
+    coreCells += '<div class="corecell"><canvas id="cc-'+i+'"></canvas></div>';
+  }
+  var chart =
+    '<div class="cpubox"><div class="cpubar"><div class="lbl">ЦП</div>'+
+      '<div class="bar"><span style="height:'+Math.round(pct)+'%"></span></div>'+
+      '<div class="v">'+Math.round(pct)+'%</div></div>'+
+      '<div class="bcvbox" style="position:relative">'+
+        '<div class="coreghdr"><span>Загрузка по ядрам за 60 секунд</span>'+
+        '<span>100% / ядро</span></div>'+
+        '<div class="coregrid" style="grid-template-columns:repeat('+cols+',1fr);'+
+          'grid-template-rows:repeat('+rows+',1fr);height:280px">'+coreCells+'</div>'+
+      '</div></div>';
+
+  el("sysmonChart").innerHTML =
+    '<div class="chdr">'+
+      '<h2 class="ctitle">ЦП</h2>'+
+      '<div class="cmodel">'+esc(c.model||"")+'</div>'+
+      '<div class="crange">1 минута</div>'+
+    '</div>'+
+    chart;
+  // отрисуем per-core
+  (c.per_core_pct||[]).forEach(function(_, i){
+    var cv=el("cc-"+i); if(!cv) return;
+    drawArea(cv, _sysmon.hist.cores[i]||[], "#28e0c4", 100, true);
+  });
+  // правая колонка
   var freqAvg = (c.freq_mhz && c.freq_mhz.length)
     ? Math.round(c.freq_mhz.reduce(function(a,b){return a+b;},0)/c.freq_mhz.length) : null;
-  var h='<h2>CPU</h2>'+
-    '<div class="sub">'+esc(c.model||"")+'</div>'+
-    _bigChart("Загрузка CPU", pct, _sysmon.series.cpu, "#28e0c4", 100, "%")+
-    '<div class="statgrid">'+
-      '<div class="statcell"><div class="l">Загрузка</div><div class="v">'+pct+'</div></div>'+
-      '<div class="statcell"><div class="l">Ядер</div><div class="v">'+(c.cores||0)+'</div></div>'+
-      '<div class="statcell"><div class="l">Load avg</div><div class="v" style="font-size:14px">'+
-        esc(load||"&mdash;")+'</div></div>'+
-      (freqAvg?('<div class="statcell"><div class="l">Частота</div><div class="v">'+freqAvg+
-        '<span class="u">MHz</span></div></div>'):'')+
-    '</div>';
-  if(c.per_core_pct && c.per_core_pct.length){
-    h += '<div class="lbl" style="margin-top:18px;font-size:11px;color:var(--dim);'+
-         'text-transform:uppercase;letter-spacing:.4px">Per-core</div><div class="corebars">';
-    c.per_core_pct.forEach(function(p, i){
-      var v = p==null?0:Math.round(p);
-      var cls = v>=90?"err":(v>=70?"warn":"");
-      h += '<div class="corebar"><span>core '+i+'</span>'+
-           '<span><span class="cb"><span class="'+cls+'" style="width:'+v+'%"></span></span> '+v+'%</span></div>';
-    });
-    h += '</div>';
-  }
-  el("sysmonDetail").innerHTML = h;
+  var hs =
+    _specRow("Использование", '<span style="color:'+dev.color+'">'+(Math.round(pct))+' %</span>')+
+    _specRow("Скорость", fmtFreqGHz(freqAvg))+
+    _specRow("Процессы", (c.proc_count!=null?c.proc_count:"—"))+
+    _specRow("Потоки", (c.thread_count!=null?c.thread_count:"—"))+
+    _specRow("Время работы", (c.uptime_secs!=null?fmtSecsHMS(c.uptime_secs):"—"))+
+    '<div class="sgrp">Спецификации</div>'+
+    _specRow("Базовая скорость", fmtFreqGHz(c.base_freq_mhz))+
+    _specRow("Сокеты", (c.sockets||1))+
+    _specRow("Ядра", (c.cores||"—"))+
+    _specRow("Виртуальные процессоры", (c.cores||"—"))+
+    _specRow("Виртуализация", esc(c.vm_vendor||"—"));
+  el("sysmonSpecs").innerHTML = hs;
 }
-function _renderSysmonRAM(d){
-  var m = d.ram || {};
-  var used = (m.total_kib && m.available_kib!=null) ? (m.total_kib-m.available_kib) : null;
-  var usedPct = (used!=null && m.total_kib) ? Math.round(used/m.total_kib*100) : null;
-  var swapUsed = (m.swap_total_kib && m.swap_free_kib!=null) ? (m.swap_total_kib-m.swap_free_kib) : null;
-  var swapPct = (swapUsed!=null && m.swap_total_kib) ? Math.round(swapUsed/m.swap_total_kib*100) : null;
-  var h='<h2>Память (RAM)</h2>'+
-    '<div class="sub">оперативная память и swap</div>'+
-    _bigChart("Использование", (usedPct==null?"&mdash;":usedPct+"%"), _sysmon.series.ram, "#e87da0", 100, "%")+
-    '<div class="statgrid">'+
-      '<div class="statcell"><div class="l">Всего</div><div class="v">'+fmtBytesKiB(m.total_kib)+'</div></div>'+
-      '<div class="statcell"><div class="l">Использовано</div><div class="v">'+fmtBytesKiB(used)+
-        (usedPct!=null?(' <span class="u">'+usedPct+'%</span>'):'')+'</div></div>'+
-      '<div class="statcell"><div class="l">Доступно</div><div class="v">'+fmtBytesKiB(m.available_kib)+'</div></div>'+
-      '<div class="statcell"><div class="l">Кэш</div><div class="v">'+fmtBytesKiB(m.cached_kib)+'</div></div>'+
-      '<div class="statcell"><div class="l">Swap</div><div class="v">'+
-        (m.swap_total_kib?(fmtBytesKiB(swapUsed)+' / '+fmtBytesKiB(m.swap_total_kib)+
-          (swapPct!=null?(' <span class="u">'+swapPct+'%</span>'):'')):'<span class="u">не настроен</span>')+
-        '</div></div>'+
-    '</div>';
-  el("sysmonDetail").innerHTML = h;
-}
-function _renderSysmonNet(d){
-  var rates = (d.net && d.net.rates) || [];
-  var rxSum=0, txSum=0;
-  rates.forEach(function(r){ rxSum+=r.rx_bps; txSum+=r.tx_bps; });
-  var h='<h2>Сеть</h2>'+
-    '<div class="sub">скорости по всем интерфейсам</div>'+
-    _bigChart("Суммарный трафик (RX+TX)",
-              fmtBpsShort(rxSum+txSum), _sysmon.series.net, "#ffa657", null, "B/s")+
-    '<div class="statgrid">'+
-      '<div class="statcell"><div class="l">Σ RX</div><div class="v" style="font-size:14px">'+fmtBpsShort(rxSum)+'</div></div>'+
-      '<div class="statcell"><div class="l">Σ TX</div><div class="v" style="font-size:14px">'+fmtBpsShort(txSum)+'</div></div>'+
+function _renderSmMem(dev){
+  var d = _sysmon.data || {}; var m = d.ram || {};
+  var totB = (m.total_kib||0)*1024;
+  var avB  = (m.available_kib!=null) ? m.available_kib*1024 : 0;
+  var usedB = totB - avB;
+  var cachedB = (m.cached_kib||0)*1024;
+  var freeB = (m.free_kib||0)*1024;
+  var pct = totB ? Math.round(usedB/totB*100) : 0;
+  var swTotB = (m.swap_total_kib||0)*1024;
+  var swUsedB = swTotB - ((m.swap_free_kib||0)*1024);
+  var arcB = m.arc_size_bytes || 0;
+  var arcMaxB = m.arc_max_bytes || null;
+  var arcOk = !!m.arc_available;
+  var commB = (m.committed_kib||0)*1024;
+
+  var arcMaxLabel = arcMaxB ? fmtBytesB(arcMaxB)
+                            : (arcOk ? fmtBytesB(arcB) : "—");
+  el("sysmonChart").innerHTML =
+    '<div class="chdr">'+
+      '<h2 class="ctitle">Память</h2>'+
+      '<div class="cmodel"></div>'+
+      '<div class="crange">'+fmtBytesB(totB)+'</div>'+
     '</div>'+
-    '<div class="lbl" style="margin-top:18px;font-size:11px;color:var(--dim);'+
-         'text-transform:uppercase;letter-spacing:.4px">По интерфейсам</div>'+
-    '<table class="svctbl" style="margin-top:6px"><thead><tr>'+
-      '<th>Интерфейс</th><th>RX</th><th>TX</th><th>RX pps</th><th>TX pps</th>'+
-      '</tr></thead><tbody>';
-  if(!rates.length){ h += '<tr><td colspan="5" class="dim" style="text-align:center;padding:10px">данные ещё не собраны</td></tr>'; }
-  rates.forEach(function(r){
-    h += '<tr><td><b>'+esc(r.name)+'</b></td>'+
-      '<td class="dim">'+fmtBpsShort(r.rx_bps)+'</td>'+
-      '<td class="dim">'+fmtBpsShort(r.tx_bps)+'</td>'+
-      '<td class="dim">'+r.rx_pps+'</td>'+
-      '<td class="dim">'+r.tx_pps+'</td></tr>';
-  });
-  h += '</tbody></table>';
-  el("sysmonDetail").innerHTML = h;
+    _bigPaneHTML("bcv-mem","Использование памяти за 60 секунд", fmtBytesB(totB), dev.color)+
+    _bigPaneHTML("bcv-swap","Использование подкачки за 60 секунд",
+                 (swTotB?fmtBytesB(swTotB):"—"), "#5fd07b")+
+    _bigPaneHTML("bcv-arc",
+                 (arcOk ? "ZFS ARC cache за 60 секунд" : "ZFS ARC cache (модуль не загружен)"),
+                 arcMaxLabel, "#38bdf8");
+  _drawBcv("bcv-mem", _sysmon.hist.mem_used, dev.color, m.total_kib);
+  _drawBcv("bcv-swap", _sysmon.hist.mem_swap, "#5fd07b", m.swap_total_kib || null);
+  _drawBcv("bcv-arc", _sysmon.hist.mem_arc, "#38bdf8", arcMaxB || null);
+
+  // memstruct: used (colored), cached, free
+  var pu = totB ? Math.round((usedB-cachedB)/totB*100) : 0;  // только anon
+  var pc = totB ? Math.round(cachedB/totB*100) : 0;
+  var pf = Math.max(0, 100 - pu - pc);
+
+  el("sysmonSpecs").innerHTML =
+    _specRow("Используется", fmtBytesB(usedB))+
+    _specRow("Доступно", fmtBytesB(avB))+
+    _specRow("Кэшировано", fmtBytesB(cachedB))+
+    _specRow("ZFS ARC", (arcOk
+              ? (fmtBytesB(arcB) + (arcMaxB?(' <span class="u">/ '+fmtBytesB(arcMaxB)+'</span>'):''))
+              : '<span class="u">недоступен</span>'))+
+    _specRow("Выделено", (commB?fmtBytesB(commB):"—"))+
+    _specRow("Загрузка", pct+' %')+
+    '<div class="sgrp">Структура памяти</div>'+
+    '<div class="memstruct">'+
+      '<div class="seg" style="width:'+pu+'%;background:#5b9bd5"></div>'+
+      '<div class="seg" style="width:'+pc+'%;background:#a47bd0"></div>'+
+      '<div class="seg" style="width:'+pf+'%;background:#3a4250"></div>'+
+    '</div>'+
+    '<div class="legend">'+
+      '<span class="lk"><span class="swat" style="background:#5b9bd5"></span>Используется</span>'+
+      '<span class="lk"><span class="swat" style="background:#a47bd0"></span>Кэш</span>'+
+      '<span class="lk"><span class="swat" style="background:#3a4250"></span>Свободно</span>'+
+    '</div>'+
+    '<div class="sgrp">Спецификации</div>'+
+    _specRow("Скорость", "Неизвестно")+
+    _specRow("Модулей", "—")+
+    _specRow("Форм-фактор", "DIMM")+
+    _specRow("Тип памяти", "RAM");
 }
-function _renderSysmonStor(d){
-  var disks = (typeof lastDM!=="undefined" && lastDM && lastDM.disks) ? lastDM.disks : [];
-  var maxPct=0; disks.forEach(function(dk){ if(dk.active_pct>maxPct) maxPct=dk.active_pct; });
-  var totalRead=0, totalWrite=0;
-  disks.forEach(function(dk){ totalRead+=(dk.read_bps||0); totalWrite+=(dk.write_bps||0); });
-  var h='<h2>Хранилище</h2>'+
-    '<div class="sub">сводка нагрузки на физические диски &mdash; детальнее на вкладке Узел &rarr; Мониторинг</div>'+
-    _bigChart("Максимальная активность диска", maxPct+"%", _sysmon.series.stor, "#7badff", 100, "%")+
-    '<div class="statgrid">'+
-      '<div class="statcell"><div class="l">Дисков</div><div class="v">'+disks.length+'</div></div>'+
-      '<div class="statcell"><div class="l">Макс. busy</div><div class="v">'+Math.round(maxPct)+
-        '<span class="u">%</span></div></div>'+
-      '<div class="statcell"><div class="l">Σ чтение</div><div class="v" style="font-size:14px">'+
-        fmtBpsShort(totalRead)+'</div></div>'+
-      '<div class="statcell"><div class="l">Σ запись</div><div class="v" style="font-size:14px">'+
-        fmtBpsShort(totalWrite)+'</div></div>'+
+function _renderSmDisk(dev){
+  var name = dev.disk_name;
+  var info = dev.disk_info || {};
+  var dm = _sysmon.dm || {};
+  var ser = (dm.series||{})[name] || [];
+  var last = ser.length ? ser[ser.length-1] : {};
+  var rbps = last.rbps||0, wbps = last.wbps||0;
+  var util = last.util||0;
+  var hist = _sysmon.hist.disks[name] || {util:[], rw:[]};
+  // Cumulative counters
+  var ctr = ((dm.counters||{})[name]) || {};
+  var totR = ctr.read_bytes||0, totW = ctr.write_bytes||0;
+  var idx = ((_sysmon.dm && _sysmon.dm.disks)||[]).findIndex(function(x){return x.name===name;});
+  var typ = (info.rota==="1") ? "HDD" : "SSD";
+  var bus = (info.tran || "").toUpperCase() || "—";
+
+  // Подсчёт avg response time: ioms / total_ios * 1000 = ms per io. Берём для последних 1 сек.
+  var avgMs = 0;
+  if(last && last.riops!=null){
+    var ios = (last.riops||0)+(last.wiops||0);
+    // util — это процент busy за период; не даёт ms. Простая оценка:
+    avgMs = ios>0 ? (last.util/100/ios*1000).toFixed(2) : "0.00";
+  }
+
+  // Max bandwidth: фиксированная шкала 250→500→1000→2500→5000→10000→50000 MiB/s
+  var bwMax = 0;
+  hist.rw.forEach(function(v){ if(v>bwMax) bwMax=v; });
+  function roundBw(b){
+    var MiB = 1048576;
+    var levels = [250*MiB, 500*MiB, 1000*MiB, 2500*MiB,
+                  5000*MiB, 10000*MiB, 50000*MiB];
+    for(var i=0;i<levels.length;i++) if(b <= levels[i]) return levels[i];
+    return levels[levels.length-1];
+  }
+  bwMax = roundBw(bwMax);  // дефолт = 250 MiB/s когда трафика 0
+
+  el("sysmonChart").innerHTML =
+    '<div class="chdr">'+
+      '<h2 class="ctitle">Диск ('+(idx<0?'?':idx)+')</h2>'+
+      '<div class="cmodel">'+esc(info.model||"—")+'</div>'+
+      '<div class="crange">1 минута</div>'+
+    '</div>'+
+    _bigPaneHTML("bcv-disku","Активное время за 60 секунд","100%",dev.color)+
+    _bigPaneHTML("bcv-diskbw","Пропускная способность за 60 секунд",fmtBytesB(bwMax)+"/s","#5fd07b");
+  _drawBcv("bcv-disku", hist.util, dev.color, 100);
+  _drawBcv("bcv-diskbw", hist.rw, "#5fd07b", bwMax);
+
+  el("sysmonSpecs").innerHTML =
+    _specRow("Чтение", '<span style="color:'+dev.color+'">'+fmtBpsShort(rbps)+'</span>')+
+    _specRow("Запись", '<span style="color:#5fd07b">'+fmtBpsShort(wbps)+'</span>')+
+    _specRow("Всего прочитано", fmtBytesB(totR))+
+    _specRow("Всего записано", fmtBytesB(totW))+
+    _specRow("Активное время", util.toFixed(1)+' %')+
+    _specRow("Среднее время отклика", avgMs+' ms')+
+    '<div class="sgrp">Спецификации</div>'+
+    _specRow("Ёмкость", (info.size?fmtBytesB(+info.size):"—"))+
+    _specRow("Тип носителя", typ)+
+    _specRow("Шина", bus)+
+    _specRow("Системный диск", "—");
+}
+function _renderSmNet(dev){
+  var d = _sysmon.data || {};
+  var name = dev.net_name;
+  var rate = dev.net_rate || {};
+  var hist = _sysmon.hist.nets[name] || {tot:[], rx:[], tx:[]};
+  var ctr = (d.net && d.net.counters && d.net.counters[name]) || {};
+  // Фиксированная шкала Y: 1 → 2.5 → 5 → 10 → 25 Gbps (в B/s = bits/8)
+  var bwMax = 0;
+  hist.tot.forEach(function(v){ if(v>bwMax) bwMax=v; });
+  function roundBw2(b){
+    var levels = [125e6,      // 1 Gbps
+                  312.5e6,    // 2.5 Gbps
+                  625e6,      // 5 Gbps
+                  1250e6,     // 10 Gbps
+                  3125e6];    // 25 Gbps
+    for(var i=0;i<levels.length;i++) if(b <= levels[i]) return levels[i];
+    return levels[levels.length-1];
+  }
+  bwMax = roundBw2(bwMax);  // дефолт = 1 Gbps когда трафика 0
+
+  var rx = rate.rx_bps||0, tx = rate.tx_bps||0;
+  var totRx = ctr.rx_bytes||0, totTx = ctr.tx_bytes||0;
+
+  el("sysmonChart").innerHTML =
+    '<div class="chdr">'+
+      '<h2 class="ctitle">'+esc(name)+'</h2>'+
+      '<div class="cmodel">сетевой интерфейс</div>'+
+      '<div class="crange">1 минута</div>'+
+    '</div>'+
+    _bigPaneHTML("bcv-net","Пропускная способность за 60 секунд", fmtBitsShort(bwMax), dev.color);
+  _drawBcv("bcv-net", hist.tot, dev.color, bwMax);
+
+  el("sysmonSpecs").innerHTML =
+    _specRow("Отправка", '<span style="color:'+dev.color+'">'+fmtBitsShort(tx)+'</span>')+
+    _specRow("Получение", '<span style="color:#5fa3d6">'+fmtBitsShort(rx)+'</span>')+
+    _specRow("Всего отправлено", fmtBytesB(totTx))+
+    _specRow("Всего получено", fmtBytesB(totRx))+
+    '<div class="sgrp">Спецификации</div>'+
+    _specRow("Имя интерфейса", esc(name))+
+    _specRow("Тип соединения", "—")+
+    _specRow("Скорость линка", "—")+
+    _specRow("Аппаратный адрес", "—")+
+    _specRow("IPv4-адрес", "—")+
+    '<div class="legend" style="margin-top:10px">'+
+      '<span class="lk"><span class="swat" style="background:'+dev.color+'"></span>Отправка</span>'+
+      '<span class="lk"><span class="swat" style="background:#5fa3d6"></span>Получение</span>'+
     '</div>';
-  el("sysmonDetail").innerHTML = h;
+  // Дополним спецификации через /api/network/interfaces (отдельный fetch, кешируется в lastNet)
+  _maybeFetchNetIfaces(name, dev);
 }
-function _renderSysmonGPU(d){
+var _lastNetIf = {ts:0, data:null};
+function _maybeFetchNetIfaces(name, dev){
+  var now = Date.now();
+  function applySpecs(d){
+    if(!d || !d.interfaces) return;
+    var ent = null;
+    for(var i=0;i<d.interfaces.length;i++) if(d.interfaces[i].name===name){ ent=d.interfaces[i]; break; }
+    if(!ent) return;
+    var sp = el("sysmonSpecs"); if(!sp) return;
+    // patch только спецификации — пере-генерим часть после Спецификации
+    var rate = dev.net_rate || {};
+    var data = _sysmon.data || {};
+    var ctr = (data.net && data.net.counters && data.net.counters[name]) || {};
+    var rx = rate.rx_bps||0, tx = rate.tx_bps||0;
+    var totRx = ctr.rx_bytes||0, totTx = ctr.tx_bytes||0;
+    sp.innerHTML =
+      _specRow("Отправка", '<span style="color:'+dev.color+'">'+fmtBitsShort(tx)+'</span>')+
+      _specRow("Получение", '<span style="color:#5fa3d6">'+fmtBitsShort(rx)+'</span>')+
+      _specRow("Всего отправлено", fmtBytesB(totTx))+
+      _specRow("Всего получено", fmtBytesB(totRx))+
+      '<div class="sgrp">Спецификации</div>'+
+      _specRow("Имя интерфейса", esc(ent.name))+
+      _specRow("Тип соединения", esc(ent.type||"—"))+
+      _specRow("Скорость линка", (ent.speed_mbps?(ent.speed_mbps+" Mbps"):"—"))+
+      _specRow("Аппаратный адрес", '<code style="font-size:11px">'+esc(ent.mac||"—")+'</code>')+
+      _specRow("IPv4-адрес", (ent.ipv4&&ent.ipv4.length?'<code style="font-size:11px">'+esc(ent.ipv4[0])+'</code>':"—"))+
+      _specRow("IPv6-адрес", (ent.ipv6&&ent.ipv6.length?'<code style="font-size:11px">'+esc(ent.ipv6[0])+'</code>':"—"))+
+      '<div class="legend" style="margin-top:10px">'+
+        '<span class="lk"><span class="swat" style="background:'+dev.color+'"></span>Отправка</span>'+
+        '<span class="lk"><span class="swat" style="background:#5fa3d6"></span>Получение</span>'+
+      '</div>';
+  }
+  if(_lastNetIf.data && (now - _lastNetIf.ts) < 10000){
+    applySpecs(_lastNetIf.data); return;
+  }
+  fetch("/api/network/interfaces",{cache:"no-store"}).then(function(r){return r.json();})
+    .then(function(d){ _lastNetIf={ts:Date.now(), data:d}; applySpecs(d); })
+    .catch(function(){});
+}
+function _renderSmGPU(dev){
+  var d = _sysmon.data || {};
   if(!(d.gpu && d.gpu.available)){
-    el("sysmonDetail").innerHTML =
-      '<h2>GPU</h2><div class="sub">отдельный GPU-ускоритель</div>'+
+    el("sysmonChart").innerHTML =
+      '<div class="chdr"><h2 class="ctitle">ГП</h2><div class="cmodel"></div></div>'+
       '<div class="sysunav"><b>GPU не обнаружен</b>'+
       'Поддерживается NVIDIA через <code>nvidia-smi</code>. Для AMD/Intel — в плане.</div>';
+    el("sysmonSpecs").innerHTML = '';
     return;
   }
-  var h='<h2>GPU</h2><div class="sub">'+d.gpu.devices.length+' устройств(а)</div>'+
-    _bigChart("Утилизация (avg)", "", _sysmon.series.gpu, "#7be07b", 100, "%");
-  d.gpu.devices.forEach(function(g, i){
-    var memPct = g.mem_total_mib ? Math.round(g.mem_used_mib/g.mem_total_mib*100) : 0;
-    h += '<div class="panel-soft" style="margin-top:10px"><div class="lbl">GPU '+i+' — '+esc(g.name)+'</div>'+
-      '<div class="statgrid" style="margin-top:8px">'+
-        '<div class="statcell"><div class="l">Утилизация</div><div class="v">'+g.util_pct+
-          '<span class="u">%</span></div></div>'+
-        '<div class="statcell"><div class="l">VRAM</div><div class="v" style="font-size:14px">'+
-          g.mem_used_mib+' / '+g.mem_total_mib+' MiB '+
-          '<span class="u">'+memPct+'%</span></div></div>'+
-        '<div class="statcell"><div class="l">Температура</div><div class="v">'+g.temp_c+
-          '<span class="u">°C</span></div></div>'+
-      '</div></div>';
-  });
-  el("sysmonDetail").innerHTML = h;
+  var g0 = d.gpu.devices[0];
+  el("sysmonChart").innerHTML =
+    '<div class="chdr">'+
+      '<h2 class="ctitle">ГП</h2>'+
+      '<div class="cmodel">'+esc(g0.name)+'</div>'+
+      '<div class="crange">1 минута</div>'+
+    '</div>'+
+    _bigPaneHTML("bcv-gpu","Утилизация за 60 секунд","100%",dev.color);
+  _drawBcv("bcv-gpu", _sysmon.hist.gpu, dev.color, 100);
+  var memPct = g0.mem_total_mib ? Math.round(g0.mem_used_mib/g0.mem_total_mib*100) : 0;
+  el("sysmonSpecs").innerHTML =
+    _specRow("Утилизация", g0.util_pct+' %')+
+    _specRow("VRAM", g0.mem_used_mib+" / "+g0.mem_total_mib+" MiB ("+memPct+" %)")+
+    _specRow("Температура", g0.temp_c+" °C")+
+    '<div class="sgrp">Спецификации</div>'+
+    _specRow("Модель", esc(g0.name));
 }
-function _renderSysmonPwr(d){
+function _renderSmPwr(dev){
+  var d = _sysmon.data || {};
   if(!(d.power && d.power.available)){
-    el("sysmonDetail").innerHTML =
-      '<h2>Power</h2><div class="sub">энергопотребление CPU-пакета</div>'+
+    el("sysmonChart").innerHTML =
+      '<div class="chdr"><h2 class="ctitle">Питание</h2></div>'+
       '<div class="sysunav"><b>RAPL недоступен</b>'+
-      'Чтение энергии Intel-RAPL не работает (вероятно, узел запущен как VM,'+
-      ' либо ядро не предоставляет /sys/class/powercap/intel-rapl).</div>';
+      'Чтение Intel-RAPL не работает (VM или ядро не предоставляет /sys/class/powercap).</div>';
+    el("sysmonSpecs").innerHTML = '';
     return;
   }
-  var w = d.power.watts;
-  var h='<h2>Power</h2><div class="sub">энергопотребление CPU-пакета (Intel RAPL)</div>'+
-    _bigChart("Мощность", (w==null?"&mdash;":w+" W"), _sysmon.series.pwr, "#c79bd6", null, "W")+
-    '<div class="statgrid">'+
-      '<div class="statcell"><div class="l">Текущая</div><div class="v">'+
-        (w==null?"&mdash;":w)+'<span class="u">W</span></div></div>'+
-    '</div>';
-  el("sysmonDetail").innerHTML = h;
+  el("sysmonChart").innerHTML =
+    '<div class="chdr"><h2 class="ctitle">Питание</h2>'+
+      '<div class="cmodel">Intel RAPL (energy_uj)</div></div>'+
+    _bigPaneHTML("bcv-pwr","Мощность за 60 секунд","",dev.color);
+  _drawBcv("bcv-pwr", _sysmon.hist.pwr, dev.color, null);
+  el("sysmonSpecs").innerHTML =
+    _specRow("Текущая", (d.power.watts!=null?d.power.watts+" W":"—"));
 }
 function renderHostResources(){
   _hostFetch("/api/host/resources", "host-resources", function(d){
@@ -6991,45 +7311,6 @@ function renderHostVmct(){
     el("host-vmct").innerHTML = h;
   });
 }
-function renderHostServices(){
-  _hostFetch("/api/host/services", "host-services", function(d){
-    var h = '<table class="svctbl"><thead><tr>'+
-      '<th>Name</th><th>Status</th><th>Sub</th><th>Unit</th><th>Description</th>'+
-      '</tr></thead><tbody>';
-    (d.services||[]).forEach(function(s){
-      var cls = (s.active==="active")?"ok":(s.active==="failed"?"err":"warn");
-      h += '<tr><td><b>'+esc(s.name)+'</b></td>'+
-        '<td><span class="hstchip '+cls+'">'+esc(s.active)+'</span></td>'+
-        '<td class="dim">'+esc(s.sub||"")+'</td>'+
-        '<td class="dim">'+esc(s.enabled)+'</td>'+
-        '<td class="dim">'+esc(s.desc||"")+'</td></tr>';
-    });
-    h += '</tbody></table>';
-    el("host-services").innerHTML = h;
-  });
-}
-function _loadJournal(svc){
-  var url = "/api/host/journal" + (svc ? ("?service="+encodeURIComponent(svc)) : "");
-  fetch(url, {cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
-    var t = el("jrnText"); if(t) t.textContent = d.text || "(пусто)";
-  });
-}
-function renderHostJournal(){
-  _hostFetch("/api/host/journal", "host-journal", function(d){
-    var sel = '<select id="jrnSvc"><option value="">все службы</option>';
-    (d.services||[]).forEach(function(s){
-      var sel2 = (s===d.service) ? ' selected' : '';
-      sel += '<option value="'+esc(s)+'"'+sel2+'>'+esc(s)+'</option>';
-    });
-    sel += '</select> <button class="wizbtn" id="jrnGo">Загрузить</button>'+
-           ' <button class="wizbtn" id="jrnRefresh">&#10227; Обновить</button>';
-    var h = '<div class="journalbar">'+sel+'</div>'+
-      '<div class="jrntext" id="jrnText">'+esc(d.text || "(пусто)")+'</div>';
-    el("host-journal").innerHTML = h;
-    el("jrnGo").onclick = function(){ _loadJournal(el("jrnSvc").value); };
-    el("jrnRefresh").onclick = function(){ _loadJournal(el("jrnSvc").value); };
-  });
-}
 function renderHostCluster(){
   _hostFetch("/api/host/cluster", "host-cluster", function(d){
     var h='<table class="kvtbl">'+
@@ -7057,10 +7338,7 @@ function renderNetwork(subview){
   var titles = {
     overview: "Сеть &mdash; интерфейсы",
     bridges:  "Сеть &mdash; Bridges",
-    vlan:     "Сеть &mdash; VLAN",
-    bond:     "Сеть &mdash; Bond",
-    routes:   "Сеть &mdash; Маршруты",
-    firewall: "Сеть &mdash; Firewall"
+    vlan:     "Сеть &mdash; VLAN"
   };
   var nt = el("netTitle"); if(nt) nt.innerHTML = titles[sub] || "Сеть";
   document.querySelectorAll("#view-network .net-sect").forEach(function(s){
@@ -7195,23 +7473,27 @@ function applyIntervals(){
   dmTimer=setInterval(tickDiskmon,cfg.dmMs);
 }
 
-var start="storage";
-var startSub=null;
-var startCat=null;
+var start="host";
+var startSub="monitor";
+var startCat="host";
 try{
   var sv=localStorage.getItem("vb_view"); if(sv) start=sv;
+  if(start==="storage") start="host"; // миграция: страница 'storage' удалена → дефолт = Узел/Монитор
   var sc=localStorage.getItem("vb_cat"); if(sc) startCat=sc;
   if(start==="network"){ var ssub=localStorage.getItem("vb_netsub"); if(ssub) startSub=ssub; }
   if(start==="host"){ var hsub=localStorage.getItem("vb_hostsub"); if(hsub) startSub=hsub; }
 }catch(e){}
 applyVisibility();
 var visMap={vitastor:cfg.showVita,ceph:cfg.showCeph,zfs:cfg.showZfs};
-if(visMap.hasOwnProperty(start)&&!visMap[start]) start="storage";
+if(visMap.hasOwnProperty(start)&&!visMap[start]) start="host";
 if(startCat) setCategory(startCat);
 setView(start, startSub);
 var startVTab="storage";
 try{ var svt=localStorage.getItem("vb_vtab"); if(svt) startVTab=svt; }catch(e){}
 setVTab(startVTab);
+var startZfsTab="pools";
+try{ var szt=localStorage.getItem("vb_zftab"); if(szt) startZfsTab=szt; }catch(e){}
+setZfsTab(startZfsTab);
 tickOverview(); tickDiskmon();
 applyIntervals();
 setInterval(clock,1000);
@@ -7615,18 +7897,6 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/host/vmct":
             self._send(200, "application/json",
                        json.dumps(host_vmct()).encode("utf-8"))
-        elif path == "/api/host/services":
-            self._send(200, "application/json",
-                       json.dumps(host_services()).encode("utf-8"))
-        elif path == "/api/host/journal":
-            svc = ""
-            if "?" in self.path:
-                for kv in self.path.split("?", 1)[1].split("&"):
-                    if kv.startswith("service="):
-                        from urllib.parse import unquote
-                        svc = unquote(kv[8:])
-            self._send(200, "application/json",
-                       json.dumps(host_journal(svc)).encode("utf-8"))
         elif path == "/api/host/cluster":
             self._send(200, "application/json",
                        json.dumps(host_cluster()).encode("utf-8"))
