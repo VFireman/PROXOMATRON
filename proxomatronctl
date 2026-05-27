@@ -1,0 +1,121 @@
+#!/bin/bash
+# proxomatronctl — управление службой PROXOMATRON с опцией ограниченного по времени сеанса.
+#
+# Использование:
+#   proxomatronctl start              запустить службу бессрочно
+#   proxomatronctl start <время>      запустить и остановить через указанное время
+#                                   (примеры: 3h, 30min, 1h30m, 2d)
+#   proxomatronctl stop               остановить и отменить отложенную остановку
+#   proxomatronctl extend <время>     перенести отложенную остановку относительно «сейчас»
+#   proxomatronctl status             показать состояние службы и плановой остановки
+set -u
+SVC=proxomatron
+STOP_UNIT=proxomatron-autostop
+
+usage() {
+  cat >&2 <<'EOF'
+PROXOMATRON — управление службой
+
+  proxomatronctl start              запустить (работает до stop / перезагрузки)
+  proxomatronctl start <время>      запустить на ограниченное время
+                                  (примеры: 3h · 30min · 1h30m · 2d)
+  proxomatronctl stop               остановить (и отменить плановую остановку)
+  proxomatronctl extend <время>     перенести плановую остановку
+  proxomatronctl status             состояние службы и плановой остановки
+EOF
+  exit 1
+}
+
+cancel_autostop() {
+  systemctl stop "${STOP_UNIT}.timer" 2>/dev/null || true
+  systemctl stop "${STOP_UNIT}.service" 2>/dev/null || true
+  systemctl reset-failed "${STOP_UNIT}.timer" 2>/dev/null || true
+  systemctl reset-failed "${STOP_UNIT}.service" 2>/dev/null || true
+}
+
+schedule_autostop() {
+  local dur="$1"
+  cancel_autostop
+  if ! systemd-run --quiet --on-active="$dur" --unit="$STOP_UNIT" \
+       --description="auto-stop PROXOMATRON" \
+       /bin/systemctl stop "$SVC"; then
+    echo "ошибка: не удалось запланировать остановку через '$dur'" >&2
+    echo "формат времени: 3h · 30min · 1h30m · 2d (см. systemd.time(7))" >&2
+    return 1
+  fi
+}
+
+show_status() {
+  local act
+  act="$(systemctl is-active "$SVC" 2>/dev/null || true)"
+  [ -z "$act" ] && act="unknown"
+  echo "служба:  $act"
+  if systemctl is-active --quiet "${STOP_UNIT}.timer"; then
+    local row when left
+    row="$(systemctl list-timers "${STOP_UNIT}.timer" --no-pager 2>/dev/null \
+           | sed -n '2p')"
+    when="$(echo "$row" | awk '{print $1" "$2" "$3" "$4}')"
+    # LEFT — это всё с поля $5 до первого "-" (поле LAST)
+    left="$(echo "$row" | awk '{
+      out=""
+      for(i=5;i<=NF;i++){
+        if($i=="-") break
+        out = (out=="") ? $i : (out" "$i)
+      }
+      print out
+    }')"
+    [ -z "$left" ] && left="?"
+    echo "автостоп: запланирован на $when (осталось $left)"
+  else
+    echo "автостоп: не задан"
+  fi
+}
+
+cmd="${1:-}"
+[ -z "$cmd" ] && usage
+
+case "$cmd" in
+  start)
+    systemctl reset-failed "$SVC" 2>/dev/null || true
+    systemctl start "$SVC"
+    if [ "${2:-}" != "" ]; then
+      if schedule_autostop "$2"; then
+        echo "PROXOMATRON запущен на $2 — затем будет остановлен автоматически"
+      else
+        exit 1
+      fi
+    else
+      cancel_autostop
+      echo "PROXOMATRON запущен (бессрочно)"
+    fi
+    show_status
+    ;;
+  stop)
+    cancel_autostop
+    systemctl stop "$SVC"
+    echo "PROXOMATRON остановлен"
+    ;;
+  extend)
+    [ "${2:-}" = "" ] && usage
+    if ! systemctl is-active --quiet "$SVC"; then
+      echo "ошибка: служба не запущена — сначала 'proxomatronctl start'" >&2
+      exit 1
+    fi
+    if schedule_autostop "$2"; then
+      echo "плановая остановка перенесена на $2 от текущего момента"
+      show_status
+    else
+      exit 1
+    fi
+    ;;
+  status)
+    show_status
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "неизвестная команда: $cmd" >&2
+    usage
+    ;;
+esac

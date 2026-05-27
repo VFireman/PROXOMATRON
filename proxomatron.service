@@ -1,0 +1,14 @@
+[Unit]
+Description=PROXOMATRON prototype dashboard
+After=network-online.target vitastor-mon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/proxomatron/proxomatron.py
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
