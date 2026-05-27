@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.25"
+VERSION = "0.1.26"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -6289,7 +6289,7 @@ function zwMode(id){
   return null;
 }
 function zwOpen(){
-  zw={step:1,name:"",mode:"mirror",disks:[],confirm:"",info:null,
+  zw={step:1,name:"",mode:"mirror",width:2,disks:[],confirm:"",info:null,
       busy:false,result:null,err:""};
   el("zwmask").style.display="flex";
   el("zwsteps").innerHTML=""; el("zwft").innerHTML="";
@@ -6313,12 +6313,15 @@ function zwOpen(){
 }
 function zwClose(){ if(zw&&zw.busy) return; el("zwmask").style.display="none"; zw=null; }
 function zwVdev(){
-  var d=zw.disks;
+  var d=zw.disks, w=zw.width||2;
   if(zw.mode==="mirror") return "mirror "+d.join(" ");
   if(zw.mode==="zr1") return "raidz1 "+d.join(" ");
   if(zw.mode==="zr2") return "raidz2 "+d.join(" ");
-  if(zw.mode==="mirror2+2")
-    return "mirror "+d.slice(0,2).join(" ")+" mirror "+d.slice(2,4).join(" ");
+  if(zw.mode==="raid10"){
+    var parts=[]; for(var i=0;i<d.length;i+=w)
+      parts.push("mirror "+d.slice(i,i+w).join(" "));
+    return parts.join(" ");
+  }
   return d.join(" ");
 }
 function zwCmd(){
@@ -6332,11 +6335,21 @@ function zwValidate(){
     return "Пул ZFS «"+zw.name+"» уже существует.";
   var m=zwMode(zw.mode);
   if(!m) return "Выберите режим пула.";
-  if(zw.disks.length<m.min)
+  var n=zw.disks.length, w=zw.width||2;
+  if(n<m.min)
     return "Режим «"+m.nm+"» требует не менее "+m.min+" "+
            plural(m.min,"диска","дисков","дисков")+".";
-  if(m.exact&&zw.disks.length!==m.exact)
-    return "Режим «"+m.nm+"» требует ровно "+m.exact+" диска.";
+  if(m.max&&n>m.max)
+    return "Режим «"+m.nm+"» принимает не более "+m.max+" дисков.";
+  if(m.width){
+    if(zw.mode==="mirror" && n!==w)
+      return "Зеркало шириной "+w+" требует ровно "+w+" "+
+             plural(w,"диск","диска","дисков")+".";
+    if(zw.mode==="raid10"){
+      if(n%w!==0) return "RAID10: число дисков должно быть кратно ширине "+w+".";
+      if(n/w<2)   return "RAID10: минимум 2 зеркала (то есть "+(2*w)+" дисков).";
+    }
+  }
   return "";
 }
 function zwReadInputs(){
@@ -6370,11 +6383,30 @@ function zwBodyParams(){
        "<div class=\"ai\">"+m.ic+"</div><div class=\"an\">"+m.nm+"</div>"+
        "<div class=\"ad\">"+m.ad+"</div></div>";
   });
-  h+="</div></div>";
+  h+="</div>";
   var fd=(zw.info&&zw.info.free_disks)||[], m=zwMode(zw.mode)||{};
+  if(m.width){
+    h+="<div class=\"wizgrp\"><div class=\"gl\">Ширина зеркала</div>"+
+       "<div class=\"acts\">";
+    [2,3,4].forEach(function(w){
+      var on=(zw.width===w);
+      var lbl=(w===2?"2-way":(w===3?"3-way":"4-way"))+" mirror";
+      var sub=(zw.mode==="mirror"
+                ? "ровно "+w+" "+plural(w,"диск","диска","дисков")
+                : "по "+w+" "+plural(w,"диску","диска","дисков")+" в каждом зеркале");
+      h+="<div class=\"actcard"+(on?" on":"")+"\" data-zwwidth=\""+w+"\">"+
+         "<div class=\"ai\">&#9636;</div><div class=\"an\">"+lbl+"</div>"+
+         "<div class=\"ad\">"+sub+"</div></div>";
+    });
+    h+="</div></div>";
+  }
+  var hint;
+  if(m.width && zw.mode==="mirror")       hint="ровно "+(zw.width||2);
+  else if(m.width && zw.mode==="raid10")  hint="кратно "+(zw.width||2)+", минимум "+(2*(zw.width||2))+", до "+m.max;
+  else if(m.max)                           hint="минимум "+m.min+", до "+m.max;
+  else                                     hint="минимум "+m.min;
   h+="<div class=\"wizgrp\"><div class=\"gl\">Диски пула — будут стёрты "+
-     "(выбрано "+zw.disks.length+(m.exact?" из "+m.exact:
-     ", минимум "+m.min)+")</div>";
+     "(выбрано "+zw.disks.length+" &middot; "+hint+")</div>";
   if(!fd.length)
     h+="<div class=\"wizhint\">Свободных дисков нет. Пулу ZFS нужны диски без "+
        "разделов, файловой системы и точек монтирования.</div>";
@@ -6433,14 +6465,33 @@ function zwBodyResult(){
 function zwBind(){
   document.querySelectorAll(".actcard[data-zwmode]").forEach(function(c){
     c.onclick=function(){
-      zwReadInputs(); zw.mode=c.getAttribute("data-zwmode"); zw.err=""; zwRender();
+      zwReadInputs();
+      zw.mode=c.getAttribute("data-zwmode");
+      var m=zwMode(zw.mode)||{};
+      if(m.max && zw.disks.length>m.max) zw.disks=zw.disks.slice(0,m.max);
+      zw.err=""; zwRender();
+    };
+  });
+  document.querySelectorAll(".actcard[data-zwwidth]").forEach(function(c){
+    c.onclick=function(){
+      zwReadInputs();
+      zw.width=+c.getAttribute("data-zwwidth")||2;
+      zw.err=""; zwRender();
     };
   });
   document.querySelectorAll(".pick[data-zwdisk]").forEach(function(p){
     p.onclick=function(){
       zwReadInputs();
       var x=p.getAttribute("data-zwdisk"), i=zw.disks.indexOf(x);
-      if(i>=0) zw.disks.splice(i,1); else zw.disks.push(x);
+      if(i>=0){ zw.disks.splice(i,1); }
+      else{
+        var m=zwMode(zw.mode)||{};
+        if(m.max && zw.disks.length>=m.max){
+          zw.err="Достигнут максимум для режима «"+m.nm+"»: "+m.max+" дисков.";
+          zwRender(); return;
+        }
+        zw.disks.push(x);
+      }
       zw.err=""; zwRender();
     };
   });
@@ -6487,8 +6538,8 @@ function zwApply(){
   zw.busy=true; zw.result=null; zw.step=3; zwRender();
   fetch("/api/zfs/create",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({name:zw.name,mode:zw.mode,disks:zw.disks,
-                         confirm:zw.confirm})})
+    body:JSON.stringify({name:zw.name,mode:zw.mode,width:zw.width,
+                         disks:zw.disks,confirm:zw.confirm})})
     .then(function(r){return r.json();})
     .then(function(d){ zw.busy=false; zw.result=d; zwRender(); })
     .catch(function(e){
