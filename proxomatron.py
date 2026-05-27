@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.39"
+VERSION = "0.1.40"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -821,7 +821,31 @@ ZFS_TUNABLES = [
     {"key": "zfs_vdev_sync_write_max_active",  "label": "Sync write max active",
      "desc": "макс. одновременных синхронных записей на vdev (по умолчанию 10)",
      "kind": "int", "min": 1, "max": 1024, "default": 10},
+    {"key": "zfs_txg_timeout",                 "label": "TXG timeout",
+     "desc": "макс. время накопления txg перед sync, секунды (по умолчанию 5)",
+     "kind": "int", "min": 5, "max": 15, "default": 5},
 ]
+
+ZFS_SYNC_VALUES = ("standard", "always", "disabled")
+
+
+def _zfs_get_pool_sync():
+    """{pool: текущее значение sync} через `zfs get -H -o value sync <pool>`."""
+    out = {}
+    if not os.path.exists(ZFS):
+        return out
+    try:
+        zi = zfs_info()
+        for p in (zi.get("pools") or []):
+            name = p.get("name")
+            if not name or not _NAME_RE.match(name):
+                continue
+            r = run_cmd([ZFS, "get", "-H", "-o", "value", "sync", name], timeout=5)
+            if r.get("rc") == 0:
+                out[name] = (r.get("out") or "").strip()
+    except Exception:
+        pass
+    return out
 
 
 def zfs_tunables_info():
@@ -854,13 +878,22 @@ def zfs_tunables_info():
             "default": spec["default"],
             "runtime": runtime, "persist": persist.get(spec["key"]),
         })
-    return {"module_loaded": avail, "path": ZFS_MODPROBE, "params": params}
+    return {"module_loaded": avail, "path": ZFS_MODPROBE, "params": params,
+            "pool_sync": _zfs_get_pool_sync(),
+            "sync_choices": list(ZFS_SYNC_VALUES)}
 
 
-def zfs_tunables_set(values):
-    """Применить переданные значения тонких параметров runtime + сохранить в zfs.conf."""
+def zfs_tunables_set(values, pool_sync=None):
+    """Применить переданные значения тонких параметров runtime + sync per-pool + zfs.conf."""
+    if values is None:
+        values = {}
     if not isinstance(values, dict):
         return {"ok": False, "results": [], "msg": "values должен быть объектом"}
+    if pool_sync is None:
+        pool_sync = {}
+    if not isinstance(pool_sync, dict):
+        return {"ok": False, "results": [],
+                "msg": "pool_sync должен быть объектом"}
     if not os.path.exists("/sys/module/zfs/parameters"):
         return {"ok": False, "results": [],
                 "msg": "модуль ZFS не загружен — параметры недоступны"}
@@ -881,7 +914,23 @@ def zfs_tunables_set(values):
                     "msg": "%s: значение вне диапазона %d..%d" %
                            (k, s["min"], s["max"])}
         updates[k] = iv
-    if not updates:
+    sync_updates = {}
+    if pool_sync:
+        cur_sync = _zfs_get_pool_sync()
+        for pool, val in pool_sync.items():
+            v = str(val).strip()
+            if v not in ZFS_SYNC_VALUES:
+                return {"ok": False, "results": [],
+                        "msg": "sync: значение %r неверно (standard/always/disabled)" % v}
+            if not _NAME_RE.match(pool or ""):
+                return {"ok": False, "results": [],
+                        "msg": "sync: имя пула %r некорректно" % pool}
+            if pool not in cur_sync:
+                return {"ok": False, "results": [],
+                        "msg": "sync: пул %s не найден" % pool}
+            if cur_sync.get(pool) != v:
+                sync_updates[pool] = v
+    if not updates and not sync_updates:
         return {"ok": False, "results": [], "msg": "нет изменений"}
     results = []
     for k, v in updates.items():
@@ -899,6 +948,15 @@ def zfs_tunables_set(values):
                             "out": "", "err": str(e)})
             return {"ok": False, "results": results,
                     "msg": "не удалось записать %s" % k}
+    for pool, val in sync_updates.items():
+        r = run_cmd([ZFS, "set", "sync=" + val, pool], timeout=15)
+        ok = (r.get("rc") == 0)
+        results.append({"title": "zfs set sync=%s %s" % (val, pool),
+                        "ok": ok, "cmd": r.get("cmd"),
+                        "out": r.get("out"), "err": r.get("err")})
+        if not ok:
+            return {"ok": False, "results": results,
+                    "msg": "не удалось установить sync на %s" % pool}
     backup = None
     try:
         if os.path.exists(ZFS_MODPROBE):
@@ -936,8 +994,11 @@ def zfs_tunables_set(values):
         return {"ok": True, "results": results,
                 "msg": "runtime применён, но не сохранён в конфиг",
                 "backup": backup}
+    parts = []
+    if updates:      parts.append("%d параметр(ов)" % len(updates))
+    if sync_updates: parts.append("sync на %d пул(ах)" % len(sync_updates))
     return {"ok": True, "results": results, "backup": backup,
-            "msg": "Применено и сохранено: %d параметр(ов)" % len(updates)}
+            "msg": "Применено: " + (", ".join(parts) if parts else "—")}
 
 
 # ---------- мастер кеш/лог устройств (L2ARC / SLOG) ----------
@@ -7442,7 +7503,7 @@ function _tnBodyForm(){
         'autocomplete="off"></td>'+
       '</tr>';
   });
-  return '<div class="wizhint" style="margin-bottom:8px">'+
+  var html='<div class="wizhint" style="margin-bottom:8px">'+
     'Значения применяются мгновенно к загруженному модулю '+
     '<code>/sys/module/zfs/parameters/&hellip;</code> и сохраняются в '+
     '<code>'+esc(d.path||"/etc/modprobe.d/zfs.conf")+
@@ -7452,6 +7513,33 @@ function _tnBodyForm(){
         '<th>Новое значение</th></tr>'+
       rows+
     '</table>';
+  var ps=d.pool_sync||{}, names=Object.keys(ps);
+  if(names.length){
+    var choices=d.sync_choices||["standard","always","disabled"];
+    var syncRows="";
+    names.sort();
+    names.forEach(function(pool){
+      var cur=ps[pool]||"";
+      var opts=choices.map(function(v){
+        return '<option value="'+esc(v)+'"'+(v===cur?' selected':'')+'>'+
+               esc(v)+'</option>';
+      }).join("");
+      syncRows+='<tr>'+
+        '<td><b>'+esc(pool)+'</b></td>'+
+        '<td><code>'+esc(cur||"—")+'</code></td>'+
+        '<td><select class="wizsel tn-sync" data-pool="'+esc(pool)+
+          '" style="width:140px;padding:5px 8px;font-size:12px">'+opts+
+          '</select></td>'+
+        '</tr>';
+    });
+    html+='<div class="wizhint" style="margin:14px 0 4px"><b>ZFS sync (per-pool)</b> '+
+      '&middot; <code>zfs set sync=&lt;value&gt; &lt;pool&gt;</code></div>'+
+      '<table class="kvtbl" style="font-size:12.5px">'+
+        '<tr><th>Пул</th><th>Текущее</th><th>Новое</th></tr>'+
+        syncRows+
+      '</table>';
+  }
+  return html;
 }
 function _tnRender(){
   if(!_tn) return;
@@ -7503,7 +7591,13 @@ function _tnApply(){
       "<div class=\"wizerr\">"+wizEsc(bad)+"</div>");
     return;
   }
-  if(!Object.keys(values).length){
+  var poolSync={}, ps=d.pool_sync||{};
+  document.querySelectorAll(".tn-sync").forEach(function(sel){
+    var pool=sel.getAttribute("data-pool");
+    var val=sel.value;
+    if(ps[pool]!==val) poolSync[pool]=val;
+  });
+  if(!Object.keys(values).length && !Object.keys(poolSync).length){
     el("tnbody").insertAdjacentHTML("afterbegin",
       "<div class=\"wizhint\">Нет изменений.</div>");
     return;
@@ -7511,7 +7605,7 @@ function _tnApply(){
   _tn.busy=true; _tn.result=null; _tnRender();
   fetch("/api/zfs/tunables",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({confirm:"tunables",values:values})})
+    body:JSON.stringify({confirm:"tunables",values:values,pool_sync:poolSync})})
     .then(function(r){return r.json();}).then(function(j){
       _tn.busy=false; _tn.result=j; _tnRender();
     }).catch(function(e){
@@ -9310,7 +9404,8 @@ class Handler(BaseHTTPRequestHandler):
                 ).encode("utf-8"))
                 return
             with _wiz_lock:
-                resp = zfs_tunables_set(req.get("values"))
+                resp = zfs_tunables_set(req.get("values"),
+                                         req.get("pool_sync"))
             self._send(200, "application/json",
                        json.dumps(resp).encode("utf-8"))
             return
