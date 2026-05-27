@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.20"
+VERSION = "0.1.22"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -3083,7 +3083,7 @@ def host_monitor():
                     "tx_pps": max(0, int((curr["tx_packets"] - prev["tx_packets"]) / dt)),
                 })
     _net_last = {"counters": net_now, "ts": now}
-    net_rates.sort(key=lambda x: -(x["rx_bps"] + x["tx_bps"]))
+    net_rates.sort(key=lambda x: x["name"])
 
     # ===== GPU =====
     gpus = _gpu_devices()
@@ -3847,7 +3847,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
   .sysmonitem.k-mem  { --kc:#a47bd0 }
   .sysmonitem.k-disk { --kc:#5fd07b }
   .sysmonitem.k-net  { --kc:#b266ff }
-  .sysmonitem.k-pwr  { --kc:#c79bd6 }
+  .sysmonitem.k-pwr  { --kc:#ffb547 }
   .sysmonitem{background:var(--panel);
     border:1.5px solid var(--kc, var(--line));border-radius:8px;
     padding:6px 8px;cursor:pointer;transition:background .12s,box-shadow .12s;
@@ -3878,7 +3878,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
   .sysmonchart.k-mem  { --kc:#a47bd0 }
   .sysmonchart.k-disk { --kc:#5fd07b }
   .sysmonchart.k-net  { --kc:#b266ff }
-  .sysmonchart.k-pwr  { --kc:#c79bd6 }
+  .sysmonchart.k-pwr  { --kc:#ffb547 }
   .sysmonchart .chdr{display:flex;align-items:baseline;justify-content:space-between;
     gap:14px;margin-bottom:14px}
   .sysmonchart .ctitle{font-size:24px;font-weight:600;color:var(--txt);margin:0}
@@ -4107,16 +4107,16 @@ INDEX_HTML = r'''<!DOCTYPE html>
         <div class="vtab" data-vtab="settings">&#9881; Настройки</div>
       </div>
       <div class="vtabpane active" id="zftab-pools">
-        <div class="lblrow" style="margin:8px 0 2px">
-          <button class="wizbtn" id="zw-open">&#9874; Мастер пулов ZFS</button>
-          <button class="wizbtn" id="cc-open" style="margin-left:8px">&#9881; Управление кэшем</button></div>
         <div id="zfs"></div>
       </div>
       <div class="vtabpane" id="zftab-settings">
+        <div class="lblrow" style="margin:8px 0 12px">
+          <button class="wizbtn" id="zw-open">&#9874; Мастер пулов ZFS</button>
+          <button class="wizbtn" id="cc-open" style="margin-left:8px">&#9881; Управление кэшем</button></div>
         <div class="netplan">
           <div class="lbl">Настройки модуля ZFS</div>
           <ul class="planlist">
-            <li><b>ARC-кэш</b> &mdash; пока через кнопку «Управление кэшем» на вкладке «Пулы»</li>
+            <li><b>ARC-кэш</b> &mdash; кнопка «Управление кэшем» выше</li>
             <li><b>L2ARC / SLOG</b> &mdash; добавление кеш/лог устройств (в плане)</li>
             <li><b>Сжатие/дедупликация</b> &mdash; глобальные параметры (в плане)</li>
             <li><b>zfs.conf / module params</b> &mdash; редактирование <code>/etc/modprobe.d/zfs.conf</code> (в плане)</li>
@@ -4359,10 +4359,15 @@ function drawArea(cv, data, color, ymax, noGrid){
     ctx.strokeStyle="#222a35"; ctx.lineWidth=1;
     for(var g=1;g<4;g++){ var gy=h*g/4; ctx.beginPath(); ctx.moveTo(0,gy+.5); ctx.lineTo(w,gy+.5); ctx.stroke(); }
   }
-  if(!data||!data.length||ymax<=0) return;
+  if(!data||!data.length) return;
+  var ym=ymax;
+  if(ym==null){
+    ym=0; for(var k=0;k<data.length;k++) if(data[k]>ym) ym=data[k];
+  }
+  if(!(ym>0)) return;
   var N=60;
   function X(i){ return (i/(N-1))*w; }
-  function Y(v){ return h-Math.min(v,ymax)/ymax*(h-3)-1; }
+  function Y(v){ return h-Math.min(v,ym)/ym*(h-3)-1; }
   var off=N-data.length;
   ctx.beginPath(); ctx.moveTo(X(off), h);
   for(var i=0;i<data.length;i++) ctx.lineTo(X(off+i), Y(data[i]));
@@ -5101,6 +5106,13 @@ function renderSettings(){
       "<div class=\"sc\"><label class=\"vbtog\"><input type=\"checkbox\" id=\"set-show-zfs\""+
         (cfg.showZfs?" checked":"")+"><span class=\"sl\"></span></label></div></div>"+
     "</div>";
+  h+="<div class=\"lbl\">Системный монитор</div><div class=\"panel\">"+
+    "<div class=\"setrow\"><div><div class=\"sk\">Отображение vmbr</div>"+
+      "<div class=\"sd\">Linux-bridge интерфейсы (vmbr*) в списке устройств Узел &mdash; Системный монитор. "+
+      "По умолчанию выключено: только физические/VLAN/bond.</div></div>"+
+      "<div class=\"sc\"><label class=\"vbtog\"><input type=\"checkbox\" id=\"set-show-vmbr\""+
+        (cfg.showVmbr?" checked":"")+"><span class=\"sl\"></span></label></div></div>"+
+    "</div>";
   h+="<div class=\"lbl\">Источники данных</div><div class=\"panel\"><table>"+
     "<tr><th>Источник</th><th>Статус</th><th>Примечание</th></tr>"+
     srcRow("vitastor-cli", errs.length===0,
@@ -5175,6 +5187,13 @@ function renderSettings(){
   el("set-show-zfs").addEventListener("change",function(){
     cfg.showZfs=this.checked; saveCfg(); applyVisibility();
   });
+  var setVmbr=el("set-show-vmbr");
+  if(setVmbr){ setVmbr.addEventListener("change",function(){
+    cfg.showVmbr=this.checked; saveCfg();
+    if(typeof _renderSysmonList==="function" && _sysmon && _sysmon.data){
+      _renderSysmonList(); _renderSysmonDetail();
+    }
+  }); }
   renderSvcSection();
   fetch("/api/auth/me",{cache:"no-store"}).then(function(r){return r.json();})
     .then(function(j){
@@ -6985,11 +7004,12 @@ function _buildDevices(){
       disk_name: name, disk_info: d, disk_temp_c: dctr.temp_c});
   });
 
-  // Per-net tiles — только физические/bond/bridge (без tap/veth/fwbr/lo)
+  // Per-net tiles — физические/VLAN/bond (vmbr опционально, без tap/veth/fwbr/lo)
   var rates = (h.net && h.net.rates) || [];
   rates.forEach(function(r){
     var n = r.name;
     if(/^(lo|tap|veth|fwbr|fwln|fwpr)/.test(n)) return;
+    if(!cfg.showVmbr && /^vmbr/.test(n)) return;
     var hist = _sysmon.hist.nets[n] || {tot:[], rx:[], tx:[]};
     list.push({key:"net:"+n, kind:"net", color:"#b266ff",
       nm: n,
@@ -7001,7 +7021,7 @@ function _buildDevices(){
 
   // Power (если доступен)
   if(h.power && h.power.available){
-    list.push({key:"pwr", kind:"pwr", color:"#c79bd6",
+    list.push({key:"pwr", kind:"pwr", color:"#ffb547",
       nm:"Питание",
       val: (h.power.watts!=null ? h.power.watts+" W" : "—"),
       sb: "Intel RAPL",
@@ -7575,12 +7595,13 @@ function clock(){
   el("upd").textContent="обновлено "+s+" с назад";
   el("pulse").classList.toggle("stale", s>14);
 }
-var cfg={ovMs:5000,dmMs:2000,showVita:false,showCeph:false,showZfs:true};
+var cfg={ovMs:5000,dmMs:2000,showVita:false,showCeph:false,showZfs:true,showVmbr:false};
 try{ var sc=JSON.parse(localStorage.getItem("vb_cfg")||"{}");
   if(+sc.ovMs) cfg.ovMs=+sc.ovMs; if(+sc.dmMs) cfg.dmMs=+sc.dmMs;
   if(sc.hasOwnProperty("showVita")) cfg.showVita=!!sc.showVita;
   if(sc.hasOwnProperty("showCeph")) cfg.showCeph=!!sc.showCeph;
-  if(sc.hasOwnProperty("showZfs")) cfg.showZfs=!!sc.showZfs; }catch(e){}
+  if(sc.hasOwnProperty("showZfs")) cfg.showZfs=!!sc.showZfs;
+  if(sc.hasOwnProperty("showVmbr")) cfg.showVmbr=!!sc.showVmbr; }catch(e){}
 function saveCfg(){ try{ localStorage.setItem("vb_cfg",JSON.stringify(cfg)); }catch(e){} }
 var ovTimer=null, dmTimer=null;
 function applyIntervals(){
