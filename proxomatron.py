@@ -31,7 +31,7 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.27"
+VERSION = "0.1.31"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
@@ -711,6 +711,214 @@ def zfs_set_cache(bytes_val):
                 "msg": "максимум кэша применён, но не сохранён в конфиг"}
     return {"ok": True, "results": results,
             "msg": "Максимум кэша ZFS ARC установлен: %s." % _hbytes(b)}
+
+
+# ---------- тонкие настройки vdev I/O queue + dirty buffer ----------
+ZFS_TUNABLES = [
+    {"key": "zfs_vdev_async_read_max_active",  "label": "Async read max active",
+     "desc": "макс. одновременных асинхронных чтений на vdev (по умолчанию 3)",
+     "kind": "int", "min": 1, "max": 1024, "default": 3},
+    {"key": "zfs_vdev_async_write_max_active", "label": "Async write max active",
+     "desc": "макс. одновременных асинхронных записей на vdev (по умолчанию 10)",
+     "kind": "int", "min": 1, "max": 1024, "default": 10},
+    {"key": "zfs_vdev_sync_read_max_active",   "label": "Sync read max active",
+     "desc": "макс. одновременных синхронных чтений на vdev (по умолчанию 10)",
+     "kind": "int", "min": 1, "max": 1024, "default": 10},
+    {"key": "zfs_vdev_sync_write_max_active",  "label": "Sync write max active",
+     "desc": "макс. одновременных синхронных записей на vdev (по умолчанию 10)",
+     "kind": "int", "min": 1, "max": 1024, "default": 10},
+    {"key": "zfs_dirty_data_max",              "label": "Dirty data buffer (max)",
+     "desc": "грязный буфер в RAM, байты (типично 1–8 GiB; пример: 4G = 4294967296)",
+     "kind": "bytes", "min": 64 * 1024 * 1024,
+     "max": 64 * 1024 * 1024 * 1024, "default": None},
+]
+
+
+def zfs_tunables_info():
+    """Тонкие параметры vdev queue + dirty buffer: runtime, persist, defaults."""
+    avail = os.path.exists("/sys/module/zfs/parameters")
+    persist = {}
+    try:
+        if os.path.exists(ZFS_MODPROBE):
+            for raw in open(ZFS_MODPROBE):
+                m = re.match(r"options\s+zfs\s+(.*)$", raw.strip())
+                if not m:
+                    continue
+                for tok in m.group(1).split():
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        try:
+                            persist[k.strip()] = int(v.strip())
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    params = []
+    for spec in ZFS_TUNABLES:
+        runtime = None
+        if avail:
+            runtime = _read_int_file("/sys/module/zfs/parameters/" + spec["key"])
+        params.append({
+            "key": spec["key"], "label": spec["label"], "desc": spec["desc"],
+            "kind": spec["kind"], "min": spec["min"], "max": spec["max"],
+            "default": spec["default"],
+            "runtime": runtime, "persist": persist.get(spec["key"]),
+        })
+    return {"module_loaded": avail, "path": ZFS_MODPROBE, "params": params}
+
+
+def zfs_tunables_set(values):
+    """Применить переданные значения тонких параметров runtime + сохранить в zfs.conf."""
+    if not isinstance(values, dict):
+        return {"ok": False, "results": [], "msg": "values должен быть объектом"}
+    if not os.path.exists("/sys/module/zfs/parameters"):
+        return {"ok": False, "results": [],
+                "msg": "модуль ZFS не загружен — параметры недоступны"}
+    spec_by_key = {s["key"]: s for s in ZFS_TUNABLES}
+    updates = {}
+    for k, v in values.items():
+        if k not in spec_by_key:
+            return {"ok": False, "results": [],
+                    "msg": "неизвестный параметр %s" % k}
+        try:
+            iv = int(v)
+        except Exception:
+            return {"ok": False, "results": [],
+                    "msg": "%s: значение должно быть целым числом" % k}
+        s = spec_by_key[k]
+        if iv < s["min"] or iv > s["max"]:
+            return {"ok": False, "results": [],
+                    "msg": "%s: значение вне диапазона %d..%d" %
+                           (k, s["min"], s["max"])}
+        updates[k] = iv
+    if not updates:
+        return {"ok": False, "results": [], "msg": "нет изменений"}
+    results = []
+    for k, v in updates.items():
+        path = "/sys/module/zfs/parameters/" + k
+        try:
+            with open(path, "w") as f:
+                f.write(str(v))
+            results.append({"title": "Применено runtime: %s = %d" % (k, v),
+                            "ok": True,
+                            "cmd": "echo %d > %s" % (v, path),
+                            "out": "", "err": ""})
+        except Exception as e:
+            results.append({"title": "Применение %s" % k, "ok": False,
+                            "cmd": "echo %d > %s" % (v, path),
+                            "out": "", "err": str(e)})
+            return {"ok": False, "results": results,
+                    "msg": "не удалось записать %s" % k}
+    backup = None
+    try:
+        if os.path.exists(ZFS_MODPROBE):
+            backup = "%s.bak.%s" % (ZFS_MODPROBE,
+                                     time.strftime("%Y%m%d-%H%M%S"))
+            with open(ZFS_MODPROBE) as src, open(backup, "w") as dst:
+                dst.write(src.read())
+        lines = []
+        if os.path.exists(ZFS_MODPROBE):
+            lines = open(ZFS_MODPROBE).read().splitlines()
+        new_lines = []
+        for ln in lines:
+            m = re.match(r"options\s+zfs\s+(.*)$", ln.strip())
+            if not m:
+                new_lines.append(ln)
+                continue
+            kept = []
+            for tok in m.group(1).split():
+                if "=" in tok:
+                    kt = tok.split("=", 1)[0].strip()
+                    if kt in updates:
+                        continue
+                kept.append(tok)
+            if kept:
+                new_lines.append("options zfs " + " ".join(kept))
+        for k, v in updates.items():
+            new_lines.append("options zfs %s=%d" % (k, v))
+        with open(ZFS_MODPROBE, "w") as f:
+            f.write("\n".join(ln for ln in new_lines if ln.strip()) + "\n")
+        results.append({"title": "Сохранено в %s" % ZFS_MODPROBE, "ok": True,
+                        "cmd": "", "out": "", "err": ""})
+    except Exception as e:
+        results.append({"title": "Сохранение в zfs.conf", "ok": False,
+                        "cmd": "", "out": "", "err": str(e)})
+        return {"ok": True, "results": results,
+                "msg": "runtime применён, но не сохранён в конфиг",
+                "backup": backup}
+    return {"ok": True, "results": results, "backup": backup,
+            "msg": "Применено и сохранено: %d параметр(ов)" % len(updates)}
+
+
+# ---------- мастер кеш/лог устройств (L2ARC / SLOG) ----------
+def zfs_cachelog_info():
+    """Список пулов ZFS + свободные диски для мастера L2ARC / SLOG."""
+    zi = zfs_info()
+    return {"installed": zi.get("installed", True),
+            "free_disks": free_disks(),
+            "pools": [p.get("name") for p in (zi.get("pools") or [])]}
+
+
+def zfs_add_cachelog(pool, kind, disks, mirror=False):
+    """`zpool add <pool> cache|log [mirror] disk1 [disk2]`."""
+    pool = (pool or "").strip()
+    kind = (kind or "").strip()
+    disks = [str(d) for d in (disks or [])]
+    if not _NAME_RE.match(pool):
+        return {"ok": False, "results": [], "msg": "имя пула некорректно"}
+    if kind not in ("cache", "log"):
+        return {"ok": False, "results": [],
+                "msg": "тип устройства: cache (L2ARC) или log (SLOG)"}
+    if not disks:
+        return {"ok": False, "results": [], "msg": "не выбран ни один диск"}
+    if kind == "log":
+        if mirror and len(disks) != 2:
+            return {"ok": False, "results": [],
+                    "msg": "Зеркальный SLOG требует ровно 2 диска"}
+        if not mirror and len(disks) != 1:
+            return {"ok": False, "results": [],
+                    "msg": "Одиночный SLOG: ровно 1 диск (для зеркала включите опцию)"}
+    if kind == "cache" and len(disks) > 8:
+        return {"ok": False, "results": [],
+                "msg": "L2ARC: не более 8 устройств за один шаг"}
+    zi = zfs_info()
+    if pool not in [p.get("name") for p in (zi.get("pools") or [])]:
+        return {"ok": False, "results": [],
+                "msg": "пул ZFS «%s» не найден" % pool}
+    free = free_disks()
+    fset = set(d["path"] for d in free) | set(d["name"] for d in free)
+    dpaths = []
+    for d in disks:
+        p = d if d.startswith("/dev/") else "/dev/" + d
+        if d not in fset and p not in fset:
+            return {"ok": False, "results": [],
+                    "msg": "диск %s занят или не найден среди свободных" % d}
+        if p in dpaths:
+            return {"ok": False, "results": [],
+                    "msg": "диск %s выбран дважды" % d}
+        dpaths.append(p)
+    if kind == "cache":
+        vdev = ["cache"] + dpaths
+    elif mirror:
+        vdev = ["log", "mirror"] + dpaths
+    else:
+        vdev = ["log"] + dpaths
+    results = []
+    r = run_cmd([ZPOOL, "add", "-f", pool] + vdev, timeout=60)
+    ok = (r.get("rc") == 0)
+    label = "L2ARC (cache)" if kind == "cache" else (
+            "SLOG (log mirror)" if mirror else "SLOG (log)")
+    results.append({"title": "Добавление " + label + " в пул " + pool,
+                    "ok": ok, "cmd": r.get("cmd"),
+                    "out": r.get("out"), "err": r.get("err")})
+    if not ok:
+        return {"ok": False, "results": results,
+                "msg": "zpool add завершился с ошибкой"}
+    st = run_cmd([ZPOOL, "status", pool], timeout=15)
+    results.append({"title": "Состояние пула", "ok": True,
+                    "cmd": st.get("cmd"), "out": st.get("out"), "err": ""})
+    return {"ok": True, "results": results,
+            "msg": "%s добавлено в пул «%s»." % (label, pool)}
 
 
 # ---------- zfs.conf editor ----------
@@ -3830,6 +4038,8 @@ INDEX_HTML = r'''<!DOCTYPE html>
     font-size:11px;font-weight:700;cursor:pointer;letter-spacing:.3px;
     text-transform:none}
   .wizbtn:hover{background:var(--accent);color:#06231f}
+  .wizbtn.zfsbig{margin-left:0;padding:10px 22px;font-size:14px;
+    letter-spacing:.4px;min-width:260px;text-align:center;gap:6px}
   .wizmask{display:none;position:fixed;inset:0;background:rgba(4,7,11,.78);
     z-index:50;align-items:center;justify-content:center;padding:18px}
   .wizbox{background:var(--bg);border:1px solid var(--line);border-radius:14px;
@@ -4234,15 +4444,11 @@ INDEX_HTML = r'''<!DOCTYPE html>
         <div id="zfs"></div>
       </div>
       <div class="vtabpane" id="zftab-settings">
-        <div class="lblrow" style="margin:8px 0 14px;justify-content:flex-start">
-          <button class="wizbtn" id="zw-open" style="margin-left:0;padding:10px 22px;font-size:14px;letter-spacing:.4px">&#9874; Мастер пулов ZFS</button>
-          <button class="wizbtn" id="cc-open" style="margin-left:0">&#9881; Управление кэшем</button></div>
-        <div class="netplan" style="margin-top:14px">
-          <div class="lbl">В плане</div>
-          <ul class="planlist">
-            <li><b>L2ARC / SLOG</b> &mdash; добавление кеш/лог устройств</li>
-          </ul>
-        </div>
+        <div class="lblrow" style="margin:8px 0 14px;justify-content:flex-start;flex-wrap:wrap">
+          <button class="wizbtn zfsbig" id="zw-open">&#9874; Мастер пулов ZFS</button>
+          <button class="wizbtn zfsbig" id="cl-open">&#10133; Мастер кеш / лог устройств</button>
+          <button class="wizbtn zfsbig" id="cc-open">&#9881; Управление кэшем</button></div>
+        <div id="zfs-tunables"></div>
       </div>
       <div class="vtabpane" id="zftab-tuning">
         <div id="zfs-modparams"></div>
@@ -4347,6 +4553,15 @@ INDEX_HTML = r'''<!DOCTYPE html>
       <span class="wizx" id="ccclose">&times;</span></div>
     <div class="wizbody" id="ccbody"></div>
     <div class="wizft" id="ccft"></div>
+  </div>
+</div>
+
+<div class="wizmask" id="clmask">
+  <div class="wizbox" style="width:640px">
+    <div class="wizhd"><span>Мастер кеш / лог устройств (L2ARC / SLOG)</span>
+      <span class="wizx" id="clclose">&times;</span></div>
+    <div class="wizbody" id="clbody"></div>
+    <div class="wizft" id="clft"></div>
   </div>
 </div>
 
@@ -4455,7 +4670,8 @@ function setZfsTab(name){
     p.classList.toggle("active", p.id==="zftab-"+name);
   });
   try{ localStorage.setItem("vb_zftab", name); }catch(e){}
-  if(name==="tuning" && typeof renderZfsModparams==="function") renderZfsModparams();
+  if(name==="settings" && typeof renderZfsTunables==="function") renderZfsTunables();
+  if(name==="tuning"   && typeof renderZfsModparams==="function") renderZfsModparams();
 }
 document.querySelectorAll("#view-zfs .vtab").forEach(function(t){
   t.addEventListener("click", function(){ setZfsTab(t.getAttribute("data-vtab")); });
@@ -6705,6 +6921,363 @@ el("ccmask").addEventListener("click",function(e){
   if(e.target===this&&cc&&!cc.busy) ccClose();
 });
 
+/* ===== Мастер кеш / лог устройств (L2ARC / SLOG) ===== */
+var cl=null;
+function clOpen(){
+  cl={info:null,pool:"",kind:"cache",disks:[],mirror:false,
+      busy:false,result:null,err:""};
+  el("clmask").style.display="flex";
+  el("clbody").innerHTML="<div class=\"wizhint\">Загрузка пулов и свободных дисков…</div>";
+  el("clft").innerHTML="";
+  fetch("/api/zfs/cachelog-info",{cache:"no-store"})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      cl.info=d;
+      if(d.installed===false){
+        el("clbody").innerHTML="<div class=\"wizerr\">ZFS на узле не "+
+          "установлен — нет утилит zpool / zfs.</div>";
+        el("clft").innerHTML="<div class=\"sp\"></div>"+
+          "<button class=\"wzb\" id=\"cl-cancel\">Закрыть</button>";
+        var b=el("cl-cancel"); if(b) b.onclick=clClose; return;
+      }
+      if(!(d.pools||[]).length){
+        el("clbody").innerHTML="<div class=\"wizerr\">Нет ZFS-пулов — сначала "+
+          "создайте пул через «Мастер пулов ZFS».</div>";
+        el("clft").innerHTML="<div class=\"sp\"></div>"+
+          "<button class=\"wzb\" id=\"cl-cancel\">Закрыть</button>";
+        var b2=el("cl-cancel"); if(b2) b2.onclick=clClose; return;
+      }
+      cl.pool=d.pools[0];
+      clRender();
+    })
+    .catch(function(e){
+      el("clbody").innerHTML="<div class=\"wizerr\">Не удалось загрузить "+
+        "данные: "+e+"</div>";
+    });
+}
+function clClose(){ if(cl&&cl.busy) return; el("clmask").style.display="none"; cl=null; }
+function clVdev(){
+  var d=cl.disks;
+  if(cl.kind==="cache") return "cache "+d.join(" ");
+  if(cl.mirror) return "log mirror "+d.join(" ");
+  return "log "+d.join(" ");
+}
+function clCmd(){
+  return "zpool add -f "+(cl.pool||"<pool>")+" "+
+         (cl.disks.length?clVdev():"<устройства>");
+}
+function clValidate(){
+  if(!cl.pool) return "Выберите пул.";
+  if(cl.kind!=="cache"&&cl.kind!=="log") return "Выберите тип устройства.";
+  var n=cl.disks.length;
+  if(!n) return "Выберите хотя бы одно устройство.";
+  if(cl.kind==="log"){
+    if(cl.mirror && n!==2)  return "Зеркальный SLOG: ровно 2 устройства.";
+    if(!cl.mirror && n!==1) return "Одиночный SLOG: ровно 1 устройство.";
+  }
+  if(cl.kind==="cache" && n>8) return "L2ARC: не более 8 устройств за один шаг.";
+  return "";
+}
+function clBodyForm(){
+  var i=cl.info||{}, fd=i.free_disks||[], pools=i.pools||[];
+  var h="<div class=\"wizgrp\"><div class=\"gl\">Целевой пул</div>";
+  h+="<div class=\"wizfld\"><label>Пул ZFS</label>"+
+     "<select class=\"wizsel\" id=\"cl-pool\" style=\"flex:none;width:200px\">";
+  pools.forEach(function(p){
+    h+="<option value=\""+wizEsc(p)+"\""+(p===cl.pool?" selected":"")+
+       ">"+wizEsc(p)+"</option>";
+  });
+  h+="</select></div></div>";
+  h+="<div class=\"wizgrp\"><div class=\"gl\">Тип устройства</div>"+
+     "<div class=\"acts\">";
+  [{id:"cache",ic:"&#9636;",nm:"L2ARC (cache)",
+    ad:"вторичный кэш чтения, рекомендуется SSD"},
+   {id:"log",  ic:"&#9707;",nm:"SLOG (log)",
+    ad:"журнал ZIL, ускоряет sync-запись, нужен NVRAM/SSD с PLP"}].forEach(function(k){
+    var on=(cl.kind===k.id);
+    h+="<div class=\"actcard"+(on?" on":"")+"\" data-clkind=\""+k.id+"\">"+
+       "<div class=\"ai\">"+k.ic+"</div><div class=\"an\">"+k.nm+"</div>"+
+       "<div class=\"ad\">"+k.ad+"</div></div>";
+  });
+  h+="</div></div>";
+  if(cl.kind==="log"){
+    h+="<div class=\"wizgrp\"><div class=\"gl\">Опции SLOG</div>"+
+       "<label style=\"display:flex;gap:8px;align-items:center;padding:0 4px\">"+
+       "<input type=\"checkbox\" id=\"cl-mirror\""+(cl.mirror?" checked":"")+">"+
+       "<span>Зеркальный SLOG (потребуется 2 диска)</span></label></div>";
+  }
+  var need;
+  if(cl.kind==="cache")       need="1–8 устройств";
+  else if(cl.mirror)          need="ровно 2 устройства";
+  else                        need="ровно 1 устройство";
+  h+="<div class=\"wizgrp\"><div class=\"gl\">Устройства — будут стёрты "+
+     "(выбрано "+cl.disks.length+" &middot; "+need+")</div>";
+  if(!fd.length)
+    h+="<div class=\"wizhint\">Свободных дисков нет.</div>";
+  fd.forEach(function(d){
+    var idx=cl.disks.indexOf(d.path), on=idx>=0;
+    h+="<div class=\"pick"+(on?" on":"")+"\" data-cldisk=\""+wizEsc(d.path)+
+       "\"><input type=\"checkbox\""+(on?" checked":"")+">"+
+       "<span class=\"pk-nm\">"+wizEsc(d.name)+"</span>"+
+       (on?"<span class=\"tagchip\">#"+(idx+1)+"</span>":"")+
+       "<span class=\"pk-meta\">"+hb(d.size)+
+       (d.model?" &middot; "+wizEsc(d.model):"")+"</span></div>";
+  });
+  h+="</div>";
+  h+="<div class=\"wizgrp\"><div class=\"gl\">Команда</div>"+
+     "<div class=\"planrow\"><div class=\"pn\">$</div><div>"+
+     "<div class=\"pc\">"+wizEsc(clCmd())+"</div></div></div></div>";
+  h+="<div class=\"wizerr\">Выбранные устройства будут безвозвратно стёрты "+
+     "и привязаны к пулу.</div>";
+  return h;
+}
+function clBodyResult(){
+  var r=cl.result;
+  if(!r) return "";
+  if(r.error) return "<div class=\"wizerr\">"+wizEsc(r.error)+"</div>";
+  var h=(r.ok?"<div class=\"wizok\">&#10003; "+wizEsc(r.msg)+"</div>"
+             :"<div class=\"wizerr\">&#9888; "+wizEsc(r.msg)+"</div>");
+  (r.results||[]).forEach(function(s){
+    h+="<div class=\"resrow "+(s.ok?"ok":"bad")+"\"><div class=\"rt\">"+
+       (s.ok?"&#10003; ":"&#10007; ")+wizEsc(s.title)+"</div>";
+    if(s.cmd) h+="<div class=\"ro\">$ "+wizEsc(s.cmd)+"</div>";
+    if(s.out) h+="<div class=\"ro\">"+wizEsc(s.out)+"</div>";
+    if(s.err) h+="<div class=\"ro re\">"+wizEsc(s.err)+"</div>";
+    h+="</div>";
+  });
+  return h;
+}
+function clBind(){
+  var b;
+  if(b=el("cl-pool")) b.onchange=function(){ cl.pool=this.value; clFooter(); };
+  if(b=el("cl-mirror")) b.onchange=function(){
+    cl.mirror=this.checked;
+    if(!cl.mirror && cl.disks.length>1) cl.disks=cl.disks.slice(0,1);
+    if(cl.mirror && cl.disks.length>2) cl.disks=cl.disks.slice(0,2);
+    clRender();
+  };
+  document.querySelectorAll(".actcard[data-clkind]").forEach(function(c){
+    c.onclick=function(){
+      cl.kind=c.getAttribute("data-clkind");
+      if(cl.kind==="cache") cl.mirror=false;
+      if(cl.kind==="log"){
+        if(!cl.mirror && cl.disks.length>1) cl.disks=cl.disks.slice(0,1);
+        if(cl.mirror && cl.disks.length>2) cl.disks=cl.disks.slice(0,2);
+      }
+      cl.err=""; clRender();
+    };
+  });
+  document.querySelectorAll(".pick[data-cldisk]").forEach(function(p){
+    p.onclick=function(){
+      var x=p.getAttribute("data-cldisk"), i=cl.disks.indexOf(x);
+      if(i>=0){ cl.disks.splice(i,1); }
+      else{
+        var lim=(cl.kind==="cache")?8:(cl.mirror?2:1);
+        if(cl.disks.length>=lim){
+          cl.err="Достигнут лимит: "+lim+" "+
+            (lim===1?"устройство":(lim<5?"устройства":"устройств"))+".";
+          clRender(); return;
+        }
+        cl.disks.push(x);
+      }
+      cl.err=""; clRender();
+    };
+  });
+}
+function clFooter(){
+  if(cl.busy){ el("clft").innerHTML=""; return; }
+  if(cl.result){
+    el("clft").innerHTML="<div class=\"sp\"></div>"+
+      "<button class=\"wzb pri\" id=\"cl-done\">Закрыть</button>";
+    var d=el("cl-done"); if(d) d.onclick=function(){ clClose(); tickOverview(); };
+    return;
+  }
+  var ok=!clValidate();
+  el("clft").innerHTML="<div class=\"sp\"></div>"+
+    "<button class=\"wzb\" id=\"cl-cancel\">Отмена</button>"+
+    "<button class=\"wzb dng\" id=\"cl-apply\""+(ok?"":" disabled")+
+    ">Добавить</button>";
+  var x;
+  if(x=el("cl-cancel")) x.onclick=clClose;
+  if(x=el("cl-apply")) x.onclick=clApply;
+}
+function clRender(){
+  if(!cl) return;
+  var body;
+  if(cl.busy) body="<div class=\"wizhint\">Выполнение zpool add… не закрывайте окно.</div>";
+  else if(cl.result) body=clBodyResult();
+  else body=clBodyForm();
+  var pre=cl.err?"<div class=\"wizerr\">"+wizEsc(cl.err)+"</div>":"";
+  if(!cl.err && !cl.busy && !cl.result){
+    var ve=clValidate();
+    if(ve && cl.disks.length) pre="<div class=\"wizhint\">"+wizEsc(ve)+"</div>";
+  }
+  el("clbody").innerHTML=pre+body;
+  if(!cl.busy && !cl.result) clBind();
+  clFooter();
+}
+function clApply(){
+  var ve=clValidate(); if(ve){ cl.err=ve; clRender(); return; }
+  cl.busy=true; cl.err=""; cl.result=null; clRender();
+  fetch("/api/zfs/cachelog",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({confirm:"cachelog",pool:cl.pool,kind:cl.kind,
+                         mirror:cl.mirror,disks:cl.disks})})
+    .then(function(r){return r.json();})
+    .then(function(d){ cl.busy=false; cl.result=d; clRender(); })
+    .catch(function(e){
+      cl.busy=false; cl.result={error:"Ошибка связи с сервером: "+e}; clRender();
+    });
+}
+el("cl-open").addEventListener("click",clOpen);
+el("clclose").addEventListener("click",clClose);
+el("clmask").addEventListener("click",function(e){
+  if(e.target===this&&cl&&!cl.busy) clClose();
+});
+
+/* ===== Тонкие параметры ZFS: vdev I/O queue + dirty buffer ===== */
+var _ztn={data:null,busy:false};
+function _ztnParseBytes(s){
+  if(s==null) return NaN;
+  s=String(s).trim().replace(/\s+/g,"");
+  if(s==="") return NaN;
+  var m=s.match(/^(\d+(?:[.,]\d+)?)([KMGTkmgt])?(i?B)?$/);
+  if(!m) return Number(s); // raw digits
+  var v=parseFloat(m[1].replace(",",".")),
+      u=(m[2]||"").toUpperCase(),
+      mul=({"":1,K:1024,M:1048576,G:1073741824,T:1099511627776})[u];
+  return Math.round(v*mul);
+}
+function _ztnFmtBytes(b){
+  if(b==null||!isFinite(b)) return "—";
+  var n=+b;
+  if(n>=1073741824) return (n/1073741824).toFixed(2)+" GiB";
+  if(n>=1048576)    return (n/1048576).toFixed(1)+" MiB";
+  if(n>=1024)       return (n/1024).toFixed(1)+" KiB";
+  return n+" B";
+}
+function renderZfsTunables(){
+  var root=el("zfs-tunables"); if(!root) return;
+  if(!_ztn.data){
+    root.innerHTML='<div class="panel"><div class="lbl">'+
+      'Тонкие параметры ZFS</div>'+
+      '<div style="padding:10px 12px;color:var(--dim)">загрузка&hellip;</div></div>';
+  }
+  fetch("/api/zfs/tunables",{cache:"no-store"})
+    .then(function(r){return r.json();})
+    .then(function(d){ _ztn.data=d; _ztnDraw(); })
+    .catch(function(e){
+      root.innerHTML='<div class="panel"><div class="lbl">'+
+        'Тонкие параметры ZFS</div><div class="err" style="margin:10px 12px">'+
+        'ошибка: '+esc(String(e))+'</div></div>';
+    });
+}
+function _ztnDraw(){
+  var root=el("zfs-tunables"); if(!root) return;
+  var d=_ztn.data||{};
+  if(!d.module_loaded){
+    root.innerHTML='<div class="panel"><div class="lbl">'+
+      'Тонкие параметры ZFS</div>'+
+      '<div class="err" style="margin:10px 12px">модуль ZFS не загружен — '+
+      'параметры недоступны.</div></div>';
+    return;
+  }
+  var rows="";
+  (d.params||[]).forEach(function(p){
+    var rt=(p.runtime!=null?p.runtime:"");
+    var rtView=(p.runtime==null?"—"
+                :(p.kind==="bytes"?_ztnFmtBytes(p.runtime)+" ("+p.runtime+")"
+                                  :String(p.runtime)));
+    var psView=(p.persist==null?"—"
+                :(p.kind==="bytes"?_ztnFmtBytes(p.persist)+" ("+p.persist+")"
+                                  :String(p.persist)));
+    var ph=(p.kind==="bytes"?"например: 4G или 4294967296":String(p.default||""));
+    var width=(p.kind==="bytes"?"170px":"110px");
+    rows+='<tr>'+
+      '<td><div><b>'+esc(p.label)+'</b></div>'+
+        '<div style="color:var(--dim);font-size:11.5px"><code>'+esc(p.key)+
+        '</code> &middot; '+esc(p.desc)+'</div></td>'+
+      '<td style="white-space:nowrap"><code>'+esc(rtView)+'</code></td>'+
+      '<td style="white-space:nowrap"><code>'+esc(psView)+'</code></td>'+
+      '<td><input class="wizinp ztn-inp" data-zkey="'+esc(p.key)+
+        '" data-zkind="'+esc(p.kind)+'" value="'+esc(String(rt))+
+        '" placeholder="'+esc(ph)+'" style="width:'+width+';padding:6px 8px;'+
+        'font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px" '+
+        'autocomplete="off"></td>'+
+      '</tr>';
+  });
+  root.innerHTML=
+    '<div class="panel">'+
+      '<div class="lbl">Тонкие параметры ZFS (vdev I/O queue + dirty buffer)</div>'+
+      '<div style="padding:10px 12px">'+
+        '<div class="sd" style="margin-bottom:8px">'+
+          'Значения применяются мгновенно к загруженному модулю '+
+          '<code>/sys/module/zfs/parameters/&hellip;</code> и сохраняются в '+
+          '<code>'+esc(d.path||"/etc/modprobe.d/zfs.conf")+
+          '</code> для применения при следующей загрузке.</div>'+
+        '<table class="kvtbl" style="font-size:12.5px">'+
+          '<tr><th>Параметр</th><th>Runtime</th><th>В zfs.conf</th>'+
+            '<th>Новое значение</th></tr>'+
+          rows+
+        '</table>'+
+        '<div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
+          '<button class="vbbtn vbbtnp" id="ztn-apply">Применить и сохранить</button>'+
+          '<button class="vbbtn" id="ztn-reload">Перечитать</button>'+
+          '<span id="ztn-msg" style="font-size:12.5px;color:var(--dim)"></span>'+
+        '</div>'+
+      '</div>'+
+    '</div>';
+  el("ztn-reload").addEventListener("click",function(){
+    _ztn.data=null; renderZfsTunables();
+  });
+  el("ztn-apply").addEventListener("click",_ztnApply);
+}
+function _ztnApply(){
+  if(_ztn.busy) return;
+  var d=_ztn.data||{};
+  var values={};
+  var msg=el("ztn-msg"); msg.style.color="var(--dim)"; msg.textContent="";
+  var bad=null;
+  (d.params||[]).forEach(function(p){
+    if(bad) return;
+    var inp=document.querySelector('.ztn-inp[data-zkey="'+p.key+'"]');
+    if(!inp) return;
+    var raw=inp.value.trim();
+    if(raw==="") return;  // пропускаем пустые
+    var n=(p.kind==="bytes")?_ztnParseBytes(raw):Number(raw);
+    if(!isFinite(n) || Math.floor(n)!==n){
+      bad=p.label+": некорректное значение «"+raw+"»"; return;
+    }
+    if(p.min!=null && n<p.min){ bad=p.label+": минимум "+p.min; return; }
+    if(p.max!=null && n>p.max){ bad=p.label+": максимум "+p.max; return; }
+    if(p.runtime!==n) values[p.key]=n;
+  });
+  if(bad){ msg.style.color="var(--no)"; msg.textContent=bad; return; }
+  if(!Object.keys(values).length){
+    msg.style.color="var(--dim)"; msg.textContent="нет изменений"; return;
+  }
+  _ztn.busy=true; el("ztn-apply").disabled=true;
+  msg.textContent="применение…";
+  fetch("/api/zfs/tunables",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({confirm:"tunables",values:values})})
+    .then(function(r){return r.json();}).then(function(j){
+      _ztn.busy=false; el("ztn-apply").disabled=false;
+      if(j&&j.ok){
+        msg.style.color="var(--accent)";
+        var tail=j.backup?(" Бэкап: "+j.backup):"";
+        msg.textContent=(j.msg||"сохранено")+tail;
+        _ztn.data=null; renderZfsTunables();
+      }else{
+        msg.style.color="var(--no)";
+        msg.textContent=(j&&(j.msg||j.error))||"ошибка сохранения";
+      }
+    }).catch(function(e){
+      _ztn.busy=false; el("ztn-apply").disabled=false;
+      msg.style.color="var(--no)"; msg.textContent="ошибка связи: "+e;
+    });
+}
+
 /* ===== редактор /etc/modprobe.d/zfs.conf ===== */
 var _zmp={loaded:false,busy:false,data:null};
 function renderZfsModparams(){
@@ -7236,18 +7809,6 @@ function _buildDevices(){
     sb: [cpuFreq, cpuTemp].filter(function(x){return !!x;}).join(" · "),
     series: _sysmon.hist.cpu, ymax:100});
 
-  // GPU
-  var gAvail = !!(h.gpu && h.gpu.available);
-  var gU = null;
-  if(gAvail && h.gpu.devices && h.gpu.devices.length){
-    var u=0; h.gpu.devices.forEach(function(g){u+=g.util_pct;});
-    gU = Math.round(u / h.gpu.devices.length);
-  }
-  list.push({key:"gpu", kind:"gpu", color:"#ff8a3d",
-    nm:"ГП", val: (gU!=null ? gU+"%" : "0%"),
-    sb: gAvail ? (h.gpu.devices[0].name||"") : "",
-    series: _sysmon.hist.gpu, ymax:100, unav:!gAvail});
-
   // Memory
   var ram = h.ram || {};
   var memPct = null, memUsed = null;
@@ -7289,7 +7850,7 @@ function _buildDevices(){
     var hist = _sysmon.hist.nets[n] || {tot:[], rx:[], tx:[]};
     list.push({key:"net:"+n, kind:"net", color:"#b266ff",
       nm: n,
-      val: fmtBpsShort(r.rx_bps + r.tx_bps),
+      val: fmtBitsShort(r.rx_bps + r.tx_bps),
       sb: "S: "+fmtBitsShort(r.tx_bps)+"   R: "+fmtBitsShort(r.rx_bps),
       series: hist.tot, ymax:null,
       net_name: n, net_rate: r});
@@ -7303,6 +7864,18 @@ function _buildDevices(){
       sb: "Intel RAPL",
       series: _sysmon.hist.pwr, ymax:null});
   }
+
+  // GPU (в самом низу — на узлах серверов чаще всего отсутствует)
+  var gAvail = !!(h.gpu && h.gpu.available);
+  var gU = null;
+  if(gAvail && h.gpu.devices && h.gpu.devices.length){
+    var u=0; h.gpu.devices.forEach(function(g){u+=g.util_pct;});
+    gU = Math.round(u / h.gpu.devices.length);
+  }
+  list.push({key:"gpu", kind:"gpu", color:"#ff8a3d",
+    nm:"ГП", val: (gU!=null ? gU+"%" : "0%"),
+    sb: gAvail ? (h.gpu.devices[0].name||"") : "",
+    series: _sysmon.hist.gpu, ymax:100, unav:!gAvail});
   return list;
 }
 function _renderSysmonList(){
@@ -8306,6 +8879,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/zfs/cache":
             self._send(200, "application/json",
                        json.dumps(zfs_cache_info()).encode("utf-8"))
+        elif path == "/api/zfs/cachelog-info":
+            self._send(200, "application/json",
+                       json.dumps(zfs_cachelog_info()).encode("utf-8"))
+        elif path == "/api/zfs/tunables":
+            self._send(200, "application/json",
+                       json.dumps(zfs_tunables_info()).encode("utf-8"))
         elif path == "/api/zfs/modparams":
             self._send(200, "application/json",
                        json.dumps(zfs_modparams_info()).encode("utf-8"))
@@ -8351,6 +8930,7 @@ class Handler(BaseHTTPRequestHandler):
                         "/api/cluster/apply", "/api/node/join",
                         "/api/node/prepare-disk", "/api/zfs/create",
                         "/api/zfs/cache", "/api/zfs/modparams",
+                        "/api/zfs/cachelog", "/api/zfs/tunables",
                         "/api/service/timer", "/api/service/stop"):
             self._send(404, "text/plain; charset=utf-8",
                        "не найдено".encode("utf-8"))
@@ -8454,6 +9034,32 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with _wiz_lock:
                 resp = zfs_set_cache(req.get("bytes"))
+            with _lock:
+                _cache["ts"] = 0.0
+            self._send(200, "application/json",
+                       json.dumps(resp).encode("utf-8"))
+            return
+        if path == "/api/zfs/tunables":
+            if (req.get("confirm") or "") != "tunables":
+                self._send(200, "application/json", json.dumps(
+                    {"error": "подтверждение не получено (нужно: tunables)"}
+                ).encode("utf-8"))
+                return
+            with _wiz_lock:
+                resp = zfs_tunables_set(req.get("values"))
+            self._send(200, "application/json",
+                       json.dumps(resp).encode("utf-8"))
+            return
+        if path == "/api/zfs/cachelog":
+            if (req.get("confirm") or "") != "cachelog":
+                self._send(200, "application/json", json.dumps(
+                    {"error": "подтверждение не получено (нужно: cachelog)"}
+                ).encode("utf-8"))
+                return
+            with _wiz_lock:
+                resp = zfs_add_cachelog(req.get("pool"), req.get("kind"),
+                                        req.get("disks"),
+                                        bool(req.get("mirror")))
             with _lock:
                 _cache["ts"] = 0.0
             self._send(200, "application/json",
