@@ -31,12 +31,14 @@ PORT = 8080
 CACHE_TTL = 2.0
 SERIES_LEN = 60
 SKIP = ("nbd", "loop", "zram", "ram", "dm-", "sr")
-VERSION = "0.1.19"
+VERSION = "0.1.20"
 
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
 _wiz_lock = threading.Lock()
 _disk_cache = {"ts": 0.0, "data": None}
+_disk_temp_cache = {"ts": 0.0, "data": {}}
+_disk_temp_lock = threading.Lock()
 _series = {}
 _prev = {}
 _series_lock = threading.Lock()
@@ -290,6 +292,7 @@ def diskmon():
     with _series_lock:
         series = {k: list(v) for k, v in _series.items()}
     raw = read_diskstats() or {}
+    temps = _disk_temps()
     counters = {}
     for name, c in raw.items():
         counters[name] = {
@@ -298,6 +301,7 @@ def diskmon():
             "read_ios": c.get("reads") or 0,
             "write_ios": c.get("writes") or 0,
             "ioms": c.get("ioms") or 0,
+            "temp_c": temps.get(name),
         }
     return {"ts": time.time(), "version": VERSION,
             "disks": disks_info_cached(), "series": series,
@@ -2869,6 +2873,112 @@ def _gpu_devices():
     return devs
 
 
+def _cpu_temperature():
+    """CPU-package temp (°C) через /sys/class/hwmon (coretemp/k10temp/zenpower/cpu_thermal),
+    с fallback на /sys/class/thermal (x86_pkg_temp). None — если ничего не нашлось."""
+    best = None  # (score, °C)
+    try:
+        for base in os.listdir("/sys/class/hwmon"):
+            d = "/sys/class/hwmon/" + base
+            name = _read_file(d + "/name").strip()
+            if name not in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
+                continue
+            try:
+                files = os.listdir(d)
+            except Exception:
+                continue
+            for f in sorted(files):
+                if not f.endswith("_input"):
+                    continue
+                stem = f[:-len("_input")]
+                label = _read_file(d + "/" + stem + "_label").strip()
+                v = _read_file(d + "/" + f).strip()
+                if not v or v.lstrip("-").isdigit() is False:
+                    continue
+                try:
+                    mc = int(v)
+                except Exception:
+                    continue
+                ll = label.lower()
+                if "package" in ll:        sc = 100
+                elif ll in ("tdie",):      sc = 90
+                elif ll in ("tctl",):      sc = 80
+                elif "core" in ll:         sc = 50
+                elif not label:            sc = 40
+                else:                      sc = 30
+                if best is None or sc > best[0]:
+                    best = (sc, mc)
+    except Exception:
+        pass
+    if best is None:
+        try:
+            for base in os.listdir("/sys/class/thermal"):
+                if not base.startswith("thermal_zone"):
+                    continue
+                d = "/sys/class/thermal/" + base
+                t = _read_file(d + "/type").strip()
+                if t not in ("x86_pkg_temp", "cpu-thermal", "soc_thermal"):
+                    continue
+                v = _read_file(d + "/temp").strip()
+                try:
+                    best = (10, int(v))
+                except Exception:
+                    pass
+                if best is not None:
+                    break
+        except Exception:
+            pass
+    if best is None:
+        return None
+    return round(best[1] / 1000.0)
+
+
+def _disk_temps():
+    """{name: temp_c} через smartctl -A -n standby (HDD в простое не будятся).
+    Кэш 60 секунд, чтобы не мучить диски на каждом тике системного монитора."""
+    now = time.time()
+    with _disk_temp_lock:
+        if _disk_temp_cache["data"] and (now - _disk_temp_cache["ts"]) < 60:
+            return _disk_temp_cache["data"]
+    out = {}
+    if not os.path.exists(SMARTCTL):
+        with _disk_temp_lock:
+            _disk_temp_cache["ts"] = now
+            _disk_temp_cache["data"] = out
+        return out
+    for dd in (disks_info_cached() or []):
+        name = dd.get("name")
+        if not name or not re.match(r"^[A-Za-z0-9]+$", name):
+            continue
+        dev = "/dev/" + name
+        if not os.path.exists(dev):
+            continue
+        tc = None
+        for extra in ([], ["-d", "sat"]):
+            try:
+                p = subprocess.run(
+                    [SMARTCTL, "--json=c", "-A", "-n", "standby"] + extra + [dev],
+                    capture_output=True, text=True, timeout=6)
+                j = json.loads(p.stdout or "{}")
+            except Exception:
+                continue
+            t = (j.get("temperature") or {}).get("current")
+            if t is None:
+                nv = j.get("nvme_smart_health_information_log") or {}
+                t = nv.get("temperature")
+            if t is not None:
+                try:
+                    tc = int(t); break
+                except Exception:
+                    pass
+        if tc is not None:
+            out[name] = tc
+    with _disk_temp_lock:
+        _disk_temp_cache["ts"] = now
+        _disk_temp_cache["data"] = out
+    return out
+
+
 _vm_vendor_cache = {"v": None, "ts": 0}
 
 
@@ -3031,6 +3141,7 @@ def host_monitor():
             "vm_vendor": _vm_vendor(),
             "proc_count": nproc, "thread_count": nthr,
             "uptime_secs": uptime_s,
+            "temp_c": _cpu_temperature(),
         },
         "ram": (lambda _arc=read_arcstats(): {
             "total_kib": mem.get("MemTotal"),
@@ -6820,12 +6931,14 @@ function _buildDevices(){
 
   // CPU
   var cpu = h.cpu || {};
+  var cpuFreq = (cpu.freq_mhz && cpu.freq_mhz.length
+          ? fmtFreqGHz(Math.round(cpu.freq_mhz.reduce(function(a,b){return a+b;},0)/cpu.freq_mhz.length))
+          : (cpu.base_freq_mhz ? fmtFreqGHz(cpu.base_freq_mhz) : ""));
+  var cpuTemp = (cpu.temp_c!=null) ? (cpu.temp_c + " °C") : "";
   list.push({key:"cpu", kind:"cpu", color:"#28e0c4",
     nm:"ЦП",
     val: (cpu.pct!=null ? Math.round(cpu.pct)+"%" : "—"),
-    sb: (cpu.freq_mhz && cpu.freq_mhz.length
-          ? fmtFreqGHz(Math.round(cpu.freq_mhz.reduce(function(a,b){return a+b;},0)/cpu.freq_mhz.length))
-          : (cpu.base_freq_mhz ? fmtFreqGHz(cpu.base_freq_mhz) : "")),
+    sb: [cpuFreq, cpuTemp].filter(function(x){return !!x;}).join(" · "),
     series: _sysmon.hist.cpu, ymax:100});
 
   // GPU
@@ -6862,12 +6975,14 @@ function _buildDevices(){
     var util = hist.util.length ? hist.util[hist.util.length-1] : 0;
     var typ = (d.rota==="1") ? "HDD" : "SSD";
     var bus = (d.tran || "").toUpperCase() || "—";
+    var dctr = ((dm.counters||{})[name]) || {};
+    var dtemp = (dctr.temp_c!=null) ? (dctr.temp_c + " °C") : "";
     list.push({key:"disk:"+name, kind:"disk", color:"#5fd07b",
       nm:"Диск ("+idx+")",
       val: Math.round(util)+"%",
-      sb: typ + " · " + bus,
+      sb: [typ + " · " + bus, dtemp].filter(function(x){return !!x;}).join(" · "),
       series: hist.util, ymax:100,
-      disk_name: name, disk_info: d});
+      disk_name: name, disk_info: d, disk_temp_c: dctr.temp_c});
   });
 
   // Per-net tiles — только физические/bond/bridge (без tap/veth/fwbr/lo)
@@ -6993,6 +7108,7 @@ function _renderSmCPU(dev){
   var hs =
     _specRow("Использование", '<span style="color:'+dev.color+'">'+(Math.round(pct))+' %</span>')+
     _specRow("Скорость", fmtFreqGHz(freqAvg))+
+    _specRow("Температура", (c.temp_c!=null?(c.temp_c+" °C"):"—"))+
     _specRow("Процессы", (c.proc_count!=null?c.proc_count:"—"))+
     _specRow("Потоки", (c.thread_count!=null?c.thread_count:"—"))+
     _specRow("Время работы", (c.uptime_secs!=null?fmtSecsHMS(c.uptime_secs):"—"))+
@@ -7122,6 +7238,7 @@ function _renderSmDisk(dev){
     _specRow("Всего записано", fmtBytesB(totW))+
     _specRow("Активное время", util.toFixed(1)+' %')+
     _specRow("Среднее время отклика", avgMs+' ms')+
+    _specRow("Температура", (ctr.temp_c!=null?(ctr.temp_c+" °C"):"—"))+
     '<div class="sgrp">Спецификации</div>'+
     _specRow("Ёмкость", (info.size?fmtBytesB(+info.size):"—"))+
     _specRow("Тип носителя", typ)+
